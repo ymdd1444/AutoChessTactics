@@ -73,6 +73,26 @@ public static class DeckViewSynthesisPatch
         }
     }
 
+    /// <summary>地图打开时刷新按钮状态。</summary>
+    [HarmonyPatch(typeof(MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen), nameof(MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen.Open))]
+    public static class MapOpenPatch
+    {
+        public static void Postfix()
+        {
+            RefreshButtonVisibility();
+        }
+    }
+
+    /// <summary>地图关闭时隐藏按钮，避免战斗或事件界面残留。</summary>
+    [HarmonyPatch(typeof(MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen), "Close")]
+    public static class MapClosePatch
+    {
+        public static void Postfix()
+        {
+            RefreshButtonVisibility();
+        }
+    }
+
     /// <summary>
     /// 创建主界面按钮。GlobalUi 尚未完成时，稍后自动重试，
     /// 不依赖牌组预览界面是否打开。
@@ -147,6 +167,27 @@ public static class DeckViewSynthesisPatch
 
         run.GlobalUi.AddChild(button);
         _buttons.Add(run, button);
+        RefreshButtonVisibility();
+    }
+
+    /// <summary>
+    /// 合成入口只属于地图 UI。
+    /// NRun.GlobalUi 会贯穿战斗、事件和商店，所以不能只靠挂载位置判断。
+    /// </summary>
+    internal static void RefreshButtonVisibility()
+    {
+        NRun? run = NRun.Instance;
+        if (run == null || !_buttons.TryGetValue(run, out Button? button)
+            || button == null || !GodotObject.IsInstanceValid(button))
+        {
+            return;
+        }
+
+        bool mapOpen = run.GlobalUi?.MapScreen?.IsOpen == true;
+        bool inCombat = run.CombatRoom != null;
+        // 费用可在运行时设置，避免按钮仍显示旧价格。
+        button.Text = $"合成 ({AutoChessConfig.SynthesisCost}金币)";
+        button.Visible = mapOpen && !inCombat && !_flowRunning;
     }
 
     /// <summary>
@@ -220,7 +261,7 @@ public static class DeckViewSynthesisPatch
             if (button != null && GodotObject.IsInstanceValid(button))
             {
                 button.Disabled = false;
-                button.Visible = true;
+                RefreshButtonVisibility();
             }
         }
     }

@@ -64,7 +64,11 @@ public sealed class AutoChessRunModel : AbstractModel
         _interestScheduledRoom = null;
         _interestPaidPlayers.Clear();
         _interestAmounts.Clear();
-        StarTracker.ClearRunData();
+        // 不在这里清空星级弱引用。
+        // QuickSL 的实际顺序可能是“先重建卡牌，再触发 RunStarted”，
+        // 清空会制造“数值还是二星、星级却变一星”的半坏状态。
+        // 弱引用表不会让旧局卡牌存活；新卡实例也不会继承旧实例的星级，
+        // 因此保留表是安全的，关键是随后从存档数值恢复当前牌组。
         int recovered = SynthesisService.RecoverStarsInRunState(runState, "RunStarted");
         if (recovered > 0)
         {
@@ -149,20 +153,24 @@ public sealed class AutoChessRunModel : AbstractModel
         {
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                // 第一帧让旧房间 QueueFree 生效，第二帧让新房间完成视觉初始化。
-                await NodeUtil.AwaitProcessFrame(runNode, CancellationToken.None);
-                await NodeUtil.AwaitProcessFrame(runNode, CancellationToken.None);
+                // 房间转场的淡入淡出通常跨越多个渲染帧，飞行特效开启时
+                // 旧实现只等两帧，几乎必然仍处于 InTransition。
+                // 每次重试等待约 1/3 秒，最多 5 次，既不阻塞房间流程，
+                // 也给宝箱/商店节点足够时间完成销毁和初始化。
+                for (int frame = 0; frame < 20; frame++)
+                {
+                    await NodeUtil.AwaitProcessFrame(runNode, CancellationToken.None);
+                }
 
                 RunState? state = RunManager.Instance.DebugOnlyGetState();
                 if (state == null
                     || state.CurrentRoom == null
-                    || !ReferenceEquals(state.CurrentRoom, room)
                     || state.CurrentRoomCount <= 0)
                 {
                     Log.Debug(
                         $"[AutoChessTactics] 利息等待房间栈稳定，第 {attempt}/{maxAttempts} 次，" +
                         $"当前房间={(state?.CurrentRoom?.GetType().Name ?? "null")}，" +
-                        $"目标房间={room.GetType().Name}。");
+                        $"目标房间={room.GetType().Name}，房间引用可能已被飞行转场替换。");
                     continue;
                 }
 

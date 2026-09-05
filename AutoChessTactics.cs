@@ -37,6 +37,9 @@ public static class AutoChessTactics
     {
         try
         {
+            // 设置必须在按钮创建前读取，否则本次启动 UI 会显示旧值。
+            AutoChessConfig.Load();
+
             // 1. Harmony 补丁（id 要唯一，避免和其它 mod 冲突）
             Harmony harmony = EnsureHarmonyPatchesApplied();
 
@@ -53,6 +56,9 @@ public static class AutoChessTactics
 
             // 4. 每局开始时重置状态
             RunManager.Instance.RunStarted += AutoChessRunModel.Instance.OnRunStarted;
+
+            // 设置界面独立于具体菜单场景，延迟扫描游戏的 Mod 管理页面。
+            AutoChessSettingsUi.Initialize();
 
             Log.Info("[AutoChessTactics] 自走棋玩法加载成功！（利息/商店刷新/牌组合成）");
         }

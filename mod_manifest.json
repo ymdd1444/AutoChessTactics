@@ -1,9 +1,9 @@
 ﻿{
   "id": "AutoChessTactics",
   "name": "自走棋战术 AutoChessTactics",
-  "author": "Codex",
-  "description": "为杀戮尖塔2加入自走棋玩法：每过一个房间获得10%金币利息；商店可花20金币刷新货物；战斗/事件后可花20金币将相同卡牌合成为二星/三星（效果1.5倍/2倍，向下取整）。",
-  "version": "0.1.0",
+  "author": "ymdd1444",
+  "description": "自走棋式金币利息、商店刷新和卡牌合成玩法；支持星级卡牌、充能球、特殊卡、附魔卡与可配置的利息及商店费用。",
+  "version": "0.5.0",
   "has_pck": false,
   "has_dll": true,
   "affects_gameplay": true

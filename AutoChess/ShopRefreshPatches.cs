@@ -130,6 +130,8 @@ public static class ShopRefreshPatches
             && existing.Button != null
             && GodotObject.IsInstanceValid(existing.Button))
         {
+            // 设置可以在 Mod 管理界面中运行时修改，按钮文字也要同步更新。
+            existing.Button.Text = $"刷新商店 ({AutoChessConfig.ShopRefreshCost}金币)";
             return;
         }
 
@@ -229,6 +231,7 @@ public static class ShopRefreshPatches
             goldSpent = true;
 
             MerchantInventory fresh = MerchantInventory.CreateForNormalMerchant(player);
+            LogInventorySummary(fresh, "生成新库存");
             if (generation != state.Generation
                 || !GodotObject.IsInstanceValid(inventoryNode)
                 || !inventoryNode.IsInsideTree())
@@ -248,6 +251,12 @@ public static class ShopRefreshPatches
                     merchantRoom.Inventories[slot] = fresh;
                 }
             }
+
+            // NMerchantInventory 第一次 Initialize 时订阅旧库存。
+            // 替换 Inventory 属性不会自动订阅新条目，因此显式调用游戏自己的
+            // SubscribeToEntries，保证新库存购买后导航和商人对话仍正常工作。
+            Traverse.Create(inventoryNode).Method("SubscribeToEntries").GetValue();
+            Log.Debug($"[AutoChessTactics] 新库存事件已重新订阅，generation={generation}。");
 
             UiToast.Show("商店已刷新！");
             Log.Info($"[AutoChessTactics] 商店刷新成功：玩家 {player.NetId}，generation={generation}。");
@@ -336,5 +345,21 @@ public static class ShopRefreshPatches
         Traverse.Create(inventoryNode).Method("UpdateNavigation").GetValue();
         Log.Debug(
             $"[AutoChessTactics] 商店 UI 已安全重填：卡牌 {cards.Count}，遗物 {relics.Count}，药水 {potions.Count}。");
+    }
+
+    private static void LogInventorySummary(MerchantInventory inventory, string context)
+    {
+        try
+        {
+            string cards = string.Join(",",
+                inventory.CardEntries.Select(entry =>
+                    entry.CreationResult?.Card.Id.Entry ?? "<空>"));
+            Log.Debug(
+                $"[AutoChessTactics] {context}：卡牌={cards}，遗物={inventory.RelicEntries.Count}，药水={inventory.PotionEntries.Count}。");
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 记录库存摘要失败：{e.Message}");
+        }
     }
 }

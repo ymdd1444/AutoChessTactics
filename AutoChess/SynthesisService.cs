@@ -38,8 +38,10 @@ public static class SynthesisService
     private const decimal Star3Factor = 3.0m;
 
     /// <summary>
-    /// 在构造临时附魔基准卡时短暂禁用“附魔后重新归一”。
-    /// 这个标记只保护我们自己内部的临时卡，不影响真实卡牌流程。
+    /// 在构造临时卡、复制升级或附魔时短暂禁用“变更后重新归一”。
+    /// 这些卡只是用来计算一星基准/预期数值，不是玩家牌组中的真实卡。
+    /// 如果让它们触发 UpgradeInternal/EnchantInternal 的归一化补丁，
+    /// 就会再次进入星级推断，形成递归甚至 StackOverflow。
     /// </summary>
     private static int _suppressNormalizeAfterEnchantModify;
 
@@ -428,10 +430,13 @@ public static class SynthesisService
             // 从数据库里的原始不可变模板创建新卡。
             // 这条路径不会引用旧卡的 DynamicVars，因此天然规避“合成别的牌影响老牌”的问题。
             CardModel templateResult = ModelDb.GetById<CardModel>(source.Id).ToMutable();
-            for (int i = 0; i < source.CurrentUpgradeLevel; i++)
+            RunWithStarNormalizationSuppressed(() =>
             {
-                templateResult.UpgradeInternal();
-            }
+                for (int i = 0; i < source.CurrentUpgradeLevel; i++)
+                {
+                    templateResult.UpgradeInternal();
+                }
+            });
             if (templateResult != null && !ReferenceEquals(templateResult, source))
             {
                 error = string.Empty;
@@ -864,10 +869,14 @@ public static class SynthesisService
             CardModel baseCard = ModelDb.GetById<CardModel>(card.Id).ToMutable();
 
             // 只补当前升级数，不碰星级。
-            for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+            // 这是“计算用临时卡”，不能触发真实卡牌的升级归一化补丁。
+            RunWithStarNormalizationSuppressed(() =>
             {
-                baseCard.UpgradeInternal();
-            }
+                for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+                {
+                    baseCard.UpgradeInternal();
+                }
+            });
 
             return baseCard;
         }
@@ -939,11 +948,14 @@ public static class SynthesisService
         try
         {
             CardModel reference = ModelDb.GetById<CardModel>(card.Id).ToMutable();
-            for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+            RunWithStarNormalizationSuppressed(() =>
             {
-                reference.UpgradeInternal();
-                reference.FinalizeUpgradeInternal();
-            }
+                for (int i = 0; i < card.CurrentUpgradeLevel; i++)
+                {
+                    reference.UpgradeInternal();
+                    reference.FinalizeUpgradeInternal();
+                }
+            });
 
             // 先写入“基础卡星级值”，此时 reference 还没有附魔。
             ApplyScaledValues(reference, baseCard, targetStar);
@@ -1039,6 +1051,11 @@ public static class SynthesisService
         {
             try
             {
+                // 临时基准卡的内部升级只用于计算，不应再次触发星级归一化。
+                if (_suppressNormalizeAfterEnchantModify > 0)
+                {
+                    return;
+                }
                 NormalizeStarCard(__instance);
             }
             catch (Exception e)

@@ -23,6 +23,7 @@ public static class MapScreenPatch
         try
         {
             AutoChessRunModel.Instance.OnMapOpenedAfterRoom(isOpenedFromTopBar);
+            DeckViewSynthesisPatch.RefreshButtonVisibility();
         }
         catch (System.Exception e)
         {

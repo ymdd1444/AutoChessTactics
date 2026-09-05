@@ -20,6 +20,14 @@ public static class StarTracker
     /// <summary>星级的弱引用存储：CardModel -> 星级（1/2/3）。</summary>
     private static readonly ConditionalWeakTable<CardModel, StarInfo> _stars = new();
 
+    /// <summary>
+    /// 防止“推断星级 -> 重建基准卡 -> 触发 UpgradeInternal 补丁 ->
+    /// 再次推断星级”形成递归。游戏正常卡牌流程始终在同一线程上执行，
+    /// 用线程级深度计数即可覆盖构造基准卡的嵌套调用。
+    /// </summary>
+    [ThreadStatic]
+    private static int _inferenceDepth;
+
     /// <summary>读取一张卡实例自己的星级，未记录则为 1（一星=普通卡）。</summary>
     public static int Get(CardModel card)
     {
@@ -39,6 +47,11 @@ public static class StarTracker
     /// </summary>
     public static int GetEffective(CardModel card)
     {
+        if (card == null)
+        {
+            return 1;
+        }
+
         int star = Get(card);
         if (star > 1)
         {
@@ -72,6 +85,30 @@ public static class StarTracker
                 break;
             }
             current = next;
+        }
+
+        // 某些 SL 流程会先恢复 DynamicVars，再晚一帧恢复自定义 Props。
+        // 这里最后再用“已缩放数值”做一次严格推断，避免 UI/事件把二星卡
+        // 当成一星继续处理。TryInferStarFromScaledValues 只在数值完全匹配
+        // 理论二星/三星时返回，不会把普通升级卡误判成高星卡。
+        if (_inferenceDepth > 0)
+        {
+            return 1;
+        }
+
+        _inferenceDepth++;
+        try
+        {
+            if (SynthesisService.TryInferStarFromScaledValues(card, out int inferredStar)
+                && inferredStar > 1)
+            {
+                Set(card!, inferredStar);
+                return inferredStar;
+            }
+        }
+        finally
+        {
+            _inferenceDepth--;
         }
 
         return 1;
