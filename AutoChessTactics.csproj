@@ -1,0 +1,30 @@
+﻿<Project Sdk="Godot.NET.Sdk/4.5.1">
+  <PropertyGroup>
+    <!-- 目标框架：游戏本体是 .NET 9，mod 也用 net9.0 -->
+    <TargetFramework>net9.0</TargetFramework>
+    <!-- 允许被游戏动态加载（Assembly.Load） -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <RootNamespace>AutoChessTactics</RootNamespace>
+    <AssemblyName>AutoChessTactics</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>12</LangVersion>
+    <!-- 不生成文档文件，加快编译 -->
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- SelfTestRunner 是独立的 .NET 9 控制台测试宿主，不能被打进游戏 mod DLL。 -->
+    <Compile Remove="SelfTestRunner\**\*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- 引用游戏主程序集 sts2.dll（路径随游戏安装位置变化） -->
+    <Reference Include="sts2">
+      <HintPath>D:\SteamLibrary\steamapps\common\Slay the Spire 2\data_sts2_windows_x86_64\sts2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- 引用游戏自带的 Harmony（ModManager 会把它解析到游戏已加载的副本） -->
+    <Reference Include="0Harmony">
+      <HintPath>D:\SteamLibrary\steamapps\common\Slay the Spire 2\data_sts2_windows_x86_64\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

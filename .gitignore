@@ -1,0 +1,23 @@
+# Build outputs
+bin/
+obj/
+.godot/
+
+# User/editor files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Logs and crash dumps
+*.log
+*.dmp
+*.tmp
+
+# Packaged artifacts copied into the game mods folder
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
