@@ -11,6 +11,18 @@
     <!-- 不生成文档文件，加快编译 -->
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
   </PropertyGroup>
+  <PropertyGroup>
+    <!--
+      默认引用当前安装目录里的正式版程序集。
+      需要验证 beta 兼容时，可以用：
+        dotnet build -p:Sts2DllPath="...\beta\sts2.dll" -p:HarmonyDllPath="...\beta\0Harmony.dll"
+      这样不用把项目文件来回改成某一个分支，避免把“只兼容 beta/正式版”的路径提交出去。
+    -->
+    <Sts2Root Condition="'$(Sts2Root)' == ''">D:\SteamLibrary\steamapps\common\Slay the Spire 2</Sts2Root>
+    <Sts2DataDir Condition="'$(Sts2DataDir)' == ''">$(Sts2Root)\data_sts2_windows_x86_64</Sts2DataDir>
+    <Sts2DllPath Condition="'$(Sts2DllPath)' == ''">$(Sts2DataDir)\sts2.dll</Sts2DllPath>
+    <HarmonyDllPath Condition="'$(HarmonyDllPath)' == ''">$(Sts2DataDir)\0Harmony.dll</HarmonyDllPath>
+  </PropertyGroup>
   <ItemGroup>
     <!-- SelfTestRunner 是独立的 .NET 9 控制台测试宿主，不能被打进游戏 mod DLL。 -->
     <Compile Remove="SelfTestRunner\**\*.cs" />
@@ -18,12 +30,12 @@
   <ItemGroup>
     <!-- 引用游戏主程序集 sts2.dll（路径随游戏安装位置变化） -->
     <Reference Include="sts2">
-      <HintPath>D:\SteamLibrary\steamapps\common\Slay the Spire 2\data_sts2_windows_x86_64\sts2.dll</HintPath>
+      <HintPath>$(Sts2DllPath)</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- 引用游戏自带的 Harmony（ModManager 会把它解析到游戏已加载的副本） -->
     <Reference Include="0Harmony">
-      <HintPath>D:\SteamLibrary\steamapps\common\Slay the Spire 2\data_sts2_windows_x86_64\0Harmony.dll</HintPath>
+      <HintPath>$(HarmonyDllPath)</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

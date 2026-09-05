@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Commands;
@@ -419,6 +420,7 @@ public static class SynthesisService
                     for (int i = 0; i < source.CurrentUpgradeLevel; i++)
                     {
                         result.UpgradeInternal();
+                        result.FinalizeUpgradeInternal();
                     }
 
                     error = string.Empty;
@@ -435,6 +437,7 @@ public static class SynthesisService
                 for (int i = 0; i < source.CurrentUpgradeLevel; i++)
                 {
                     templateResult.UpgradeInternal();
+                    templateResult.FinalizeUpgradeInternal();
                 }
             });
             if (templateResult != null && !ReferenceEquals(templateResult, source))
@@ -875,6 +878,7 @@ public static class SynthesisService
                 for (int i = 0; i < card.CurrentUpgradeLevel; i++)
                 {
                     baseCard.UpgradeInternal();
+                    baseCard.FinalizeUpgradeInternal();
                 }
             });
 
@@ -1122,13 +1126,44 @@ public static class SynthesisService
         }
     }
 
-    /// <summary>带玩家上下文的克隆同样复制星级。</summary>
-    [HarmonyPatch(typeof(CardModel), nameof(CardModel.CreateCloneForPlayer))]
+    /// <summary>
+    /// 带玩家上下文的克隆同样复制星级。
+    ///
+    /// 兼容说明：
+    /// 正式版目前没有 CardModel.CreateCloneForPlayer(Player)，beta 版有。
+    /// 如果这里直接写 nameof(CardModel.CreateCloneForPlayer)，正式版编译/加载都会失败；
+    /// 因此改成运行时按字符串查找，存在就补，不存在就静默跳过。
+    /// </summary>
+    [HarmonyPatch]
     private static class CreateCloneForPlayerPatch
     {
+        private static bool Prepare()
+        {
+            // 正式版没有这个入口；Prepare 返回 false 时 Harmony 会整类跳过，
+            // 避免 PatchAll 因“没有目标方法”直接失败。
+            return FindCreateCloneForPlayerMethod() != null;
+        }
+
+        private static IEnumerable<MethodBase> TargetMethods()
+        {
+            MethodInfo? method = FindCreateCloneForPlayerMethod();
+            if (method != null)
+            {
+                yield return method;
+            }
+        }
+
         public static void Postfix(CardModel __instance, CardModel __result)
         {
             CopyStarToClone(__instance, __result);
+        }
+
+        private static MethodInfo? FindCreateCloneForPlayerMethod()
+        {
+            return AccessTools.Method(
+                typeof(CardModel),
+                "CreateCloneForPlayer",
+                new[] { typeof(Player) });
         }
     }
 
@@ -1136,13 +1171,33 @@ public static class SynthesisService
     /// 某些效果会走 CreateDupe 而不是 CreateClone。
     /// 这条路径也要把星级同步过去，不然复制出来的卡会丢掉合成状态。
     /// </summary>
-    [HarmonyPatch(typeof(CardModel), nameof(CardModel.CreateDupe))]
+    [HarmonyPatch]
     private static class CreateDupePatch
     {
+        private static IEnumerable<MethodBase> TargetMethods()
+        {
+            // 正式版：CreateDupe()
+            // beta 版：CreateDupe(Player newOwner)
+            // 两者返回值和语义一致，Postfix 只需要源卡与结果卡即可。
+            return typeof(CardModel)
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .Where(method =>
+                    method.Name == "CreateDupe"
+                    && method.ReturnType == typeof(CardModel)
+                    && IsSupportedCreateDupeSignature(method));
+        }
+
         public static void Postfix(CardModel __instance, CardModel __result)
         {
             CopyStarToClone(__instance, __result);
         }
+    }
+
+    private static bool IsSupportedCreateDupeSignature(MethodInfo method)
+    {
+        ParameterInfo[] parameters = method.GetParameters();
+        return parameters.Length == 0
+            || (parameters.Length == 1 && parameters[0].ParameterType == typeof(Player));
     }
 
     /// <summary>

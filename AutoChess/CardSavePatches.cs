@@ -4,7 +4,6 @@ using System.Linq;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Models;
-using MegaCrit.Sts2.Core.Multiplayer.Serialization;
 using MegaCrit.Sts2.Core.Saves.Runs;
 
 namespace AutoChessTactics;
@@ -20,10 +19,15 @@ namespace AutoChessTactics;
 /// 这样玩家中途保存/读档，合成结果不会丢。
 ///
 /// 已知问题与修复：
-/// SavedProperties 的 Packet 序列化（战斗回放/多人）要求属性名能映射到 net ID
-/// （ModelIdSerializationCache.GetNetIdForPropertyName），自定义的 AutoChessStar 不在映射表里，
-/// 会导致战斗结束写回放时抛异常卡死。因此我们 patch SavedProperties.Serialize，
-/// 序列化时把无法映射的属性名临时过滤掉（JSON 存档不受影响，星级仍然保留）。
+/// SavedProperties 的 Packet 序列化（战斗回放/多人）要求属性名能映射到 net ID。
+/// beta 版和正式版这里的内部缓存类名字不同：
+///   - beta：ModelIdSerializationCache.GetNetIdForPropertyName(...)
+///   - 正式版：SavedPropertiesTypeCache.GetNetIdForPropertyName(...)
+/// 自定义的 AutoChessStar 不在原版映射表里，会导致战斗结算/保存退出写 Packet 时抛异常卡死。
+///
+/// 兼容修复：
+/// 不再编译期引用任何一个版本的内部缓存类，只在 Packet 序列化前临时移除本 mod 自己的
+/// AutoChessStar 字段；JSON 存档仍然保留它，所以 SL/读档不会丢星级。
 /// </summary>
 public static class CardSavePatches
 {
@@ -114,7 +118,7 @@ public static class CardSavePatches
     }
 
     /// <summary>
-    /// SavedProperties.Serialize 补丁：跳过无法映射到 net ID 的属性名（如 AutoChessStar）。
+    /// SavedProperties.Serialize 补丁：Packet 序列化时跳过 AutoChessStar。
     /// 这样战斗回放/多人 Packet 序列化不会因未知属性名崩溃；本地 JSON 存档不受影响。
     /// </summary>
     [HarmonyPatch(typeof(SavedProperties), nameof(SavedProperties.Serialize))]
@@ -131,26 +135,22 @@ public static class CardSavePatches
                 {
                     return;
                 }
-                List<SavedProperties.SavedProperty<int>> original = __instance.ints;
-                List<SavedProperties.SavedProperty<int>> filtered = new();
-                foreach (SavedProperties.SavedProperty<int> prop in original)
+
+                if (!__instance.ints.Any(prop => prop.name == AutoChessConfig.SaveKey))
                 {
-                    try
-                    {
-                        // 能映射到 net ID 的属性名保留
-                        ModelIdSerializationCache.GetNetIdForPropertyName(prop.name);
-                        filtered.Add(prop);
-                    }
-                    catch
-                    {
-                        // 未知属性名（如 AutoChessStar）：Packet 序列化跳过，JSON 存档不受影响
-                        Log.Debug($"[AutoChessTactics] 序列化跳过未知 SavedProperty: {prop.name}");
-                    }
+                    return;
                 }
+
+                List<SavedProperties.SavedProperty<int>> original = __instance.ints;
+                List<SavedProperties.SavedProperty<int>> filtered = original
+                    .Where(prop => prop.name != AutoChessConfig.SaveKey)
+                    .ToList();
+
                 if (filtered.Count != original.Count)
                 {
                     _backups[__instance] = original;
                     __instance.ints = filtered;
+                    Log.Debug("[AutoChessTactics] Packet 序列化临时跳过 AutoChessStar；JSON 存档仍会保留星级");
                 }
             }
             catch (Exception e)
@@ -159,7 +159,7 @@ public static class CardSavePatches
             }
         }
 
-        public static void Postfix(SavedProperties __instance)
+        public static void Finalizer(SavedProperties __instance)
         {
             try
             {

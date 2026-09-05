@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using Godot;
 using MegaCrit.Sts2.Core.Logging;
 
@@ -14,10 +13,12 @@ namespace AutoChessTactics;
 public sealed partial class AutoChessSettingsUi : Node
 {
     private static AutoChessSettingsUi? _instance;
-    private readonly HashSet<Control> _trackedLabels = new();
     private double _scanTimer;
+    private CanvasLayer? _buttonLayer;
     private Button? _settingsButton;
+    private CanvasLayer? _popupLayer;
     private PanelContainer? _popup;
+    private Control? _buttonAnchor;
 
     public static void Initialize()
     {
@@ -33,39 +34,7 @@ public sealed partial class AutoChessSettingsUi : Node
 
         _instance = new AutoChessSettingsUi();
         tree.Root.CallDeferred(Node.MethodName.AddChild, _instance);
-        tree.NodeAdded += _instance.OnNodeAdded;
-        tree.NodeRemoved += _instance.OnNodeRemoved;
-        _instance.TrackRecursive(tree.Root);
         Log.Info("[AutoChessTactics] 设置界面扫描器已启动。");
-    }
-
-    private void OnNodeAdded(Node node)
-    {
-        if (node is Label or RichTextLabel)
-        {
-            _trackedLabels.Add((Control)node);
-        }
-    }
-
-    private void OnNodeRemoved(Node node)
-    {
-        if (node is Label or RichTextLabel)
-        {
-            _trackedLabels.Remove((Control)node);
-        }
-    }
-
-    private void TrackRecursive(Node node)
-    {
-        if (node is Label or RichTextLabel)
-        {
-            _trackedLabels.Add((Control)node);
-        }
-
-        foreach (Node child in node.GetChildren())
-        {
-            TrackRecursive(child);
-        }
     }
 
     public override void _Process(double delta)
@@ -77,51 +46,234 @@ public sealed partial class AutoChessSettingsUi : Node
         }
 
         _scanTimer = 0;
-        TryInjectButton();
+        try
+        {
+            TryInjectButton();
+        }
+        catch (ObjectDisposedException)
+        {
+            // 退出游戏/切换菜单时，Godot 会先销毁一批 UI 节点。
+            // 旧版本把这些已销毁节点缓存起来继续访问，会在保存退出时刷屏异常。
+            // 这里直接吞掉并隐藏按钮，下一帧如果 Mod 页面还存在会重新扫描出来。
+            HideSettingsButton();
+        }
+        catch
+        {
+            // 这个扫描器属于菜单辅助 UI，绝不能把异常抛回 Godot 主循环。
+            // 保存退出或战斗结算期间日志系统本身也可能在收尾，所以这里不再写日志。
+            HideSettingsButton();
+        }
+    }
+
+    public override void _ExitTree()
+    {
+        HideSettingsButton();
+        if (IsValid(_buttonLayer))
+        {
+            _buttonLayer!.QueueFree();
+        }
+        if (IsValid(_popupLayer))
+        {
+            _popupLayer!.QueueFree();
+        }
+
+        _buttonLayer = null;
+        _settingsButton = null;
+        _popupLayer = null;
+        _popup = null;
     }
 
     private void TryInjectButton()
     {
-        _trackedLabels.RemoveWhere(label =>
-            !GodotObject.IsInstanceValid(label) || !label.IsInsideTree());
-
-        Control? target = null;
-        foreach (Control label in _trackedLabels)
+        if (Engine.GetMainLoop() is not SceneTree tree || tree.Root == null)
         {
-            if (!label.Visible || !IsThisModLabel(GetLabelText(label)))
-            {
-                continue;
-            }
-
-            Node? parent = label.GetParent();
-            while (parent != null && parent is not VBoxContainer)
-            {
-                parent = parent.GetParent();
-            }
-
-            target = parent as Control ?? label;
-            break;
-        }
-
-        if (target == null)
-        {
-            if (_settingsButton != null && GodotObject.IsInstanceValid(_settingsButton))
-            {
-                _settingsButton.Visible = false;
-            }
+            HideSettingsButton();
             return;
         }
 
-        _settingsButton ??= CreateSettingsButton();
-        if (_settingsButton.GetParent() != target)
+        bool shouldShow = TryFindVisibleModAnchor(tree.Root, out Control? anchor);
+        if (!shouldShow)
         {
-            _settingsButton.GetParent()?.RemoveChild(_settingsButton);
-            target.AddChild(_settingsButton);
+            HideSettingsButton();
+            return;
         }
 
-        _settingsButton.Visible = true;
+        _buttonAnchor = anchor;
+        EnsureSettingsButton(tree);
+        if (!IsValid(_settingsButton))
+        {
+            return;
+        }
+
+        PositionSettingsButton(_buttonAnchor);
+        _settingsButton!.Visible = true;
         _settingsButton.MoveToFront();
-        _settingsButton.CustomMinimumSize = new Vector2(300, 52);
+    }
+
+    /// <summary>
+    /// 每次扫描当前场景树，不缓存 Label 引用。
+    /// 菜单切页和保存退出时节点销毁很快，缓存旧 Control 是 ObjectDisposedException 的来源。
+    /// </summary>
+    private bool TryFindVisibleModAnchor(Node node, out Control? anchor)
+    {
+        anchor = null;
+        int bestScore = 0;
+
+        try
+        {
+            Walk(node, ref anchor, ref bestScore);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+
+        return anchor != null;
+    }
+
+    private void Walk(Node node, ref Control? anchor, ref int bestScore)
+    {
+        if (!IsValid(node))
+        {
+            return;
+        }
+
+        // 跳过本 Mod 自己创建的浮层和弹窗，避免按钮文字让自己永远保持显示。
+        if (ReferenceEquals(node, this)
+            || (_buttonLayer != null && ReferenceEquals(node, _buttonLayer))
+            || (_popupLayer != null && ReferenceEquals(node, _popupLayer))
+            || (_popup != null && ReferenceEquals(node, _popup)))
+        {
+            return;
+        }
+
+        try
+        {
+            if (node is Control control && !IsEffectivelyVisible(control))
+            {
+                return;
+            }
+
+            if (node is Label or RichTextLabel)
+            {
+                string text = GetLabelText((Control)node);
+                int score = GetAnchorScore(text);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    anchor = (Control)node;
+                }
+            }
+
+            foreach (Node child in node.GetChildren())
+            {
+                Walk(child, ref anchor, ref bestScore);
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+    }
+
+    private static bool IsEffectivelyVisible(Control control)
+    {
+        for (Node? current = control; current != null; current = current.GetParent())
+        {
+            if (current is Control parentControl && !parentControl.Visible)
+            {
+                return false;
+            }
+        }
+
+        return control.IsInsideTree();
+    }
+
+    private void EnsureSettingsButton(SceneTree tree)
+    {
+        if (!IsValid(_buttonLayer))
+        {
+            _buttonLayer = new CanvasLayer { Layer = 100 };
+            tree.Root.AddChild(_buttonLayer);
+        }
+
+        CanvasLayer layer = _buttonLayer!;
+        if (!IsValid(_settingsButton))
+        {
+            _settingsButton = CreateSettingsButton();
+            layer.AddChild(_settingsButton);
+        }
+        else
+        {
+            // Godot 节点销毁时，托管对象可能还在但底层句柄已经失效。
+            // 所以读取 Parent 前也放在 try 里；一旦失败就丢弃旧按钮，下轮重建。
+            try
+            {
+                Button button = _settingsButton!;
+                if (button.GetParent() != layer)
+                {
+                    button.GetParent()?.RemoveChild(button);
+                    layer.AddChild(button);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                _settingsButton = null;
+            }
+        }
+    }
+
+    private void PositionSettingsButton(Control? anchor)
+    {
+        if (!IsValid(_settingsButton))
+        {
+            return;
+        }
+
+        Vector2 viewportSize = GetViewport()?.GetVisibleRect().Size ?? new Vector2(1920, 1080);
+        float width = Math.Min(460f, Math.Max(300f, viewportSize.X - 48f));
+        _settingsButton!.CustomMinimumSize = new Vector2(width, 52);
+        _settingsButton.Size = new Vector2(width, 52);
+
+        // 优先把按钮放到右侧 mod 描述块的下方，而不是整个窗口底边居中。
+        // 这样视觉上会更像“该 Mod 自己的设置入口”，也更符合当前管理页布局。
+        if (IsValid(anchor))
+        {
+            Vector2 anchorPos = anchor!.GlobalPosition;
+            float anchorBottom = anchorPos.Y + anchor.Size.Y;
+            float x = Math.Max(24f, Math.Min(anchorPos.X, viewportSize.X - width - 24f));
+            float y = Math.Max(24f, Math.Min(anchorBottom + 12f, viewportSize.Y - 72f));
+            _settingsButton.Position = new Vector2(x, y);
+            return;
+        }
+
+        _settingsButton.Position = new Vector2(
+            Math.Max(24f, (viewportSize.X - width) / 2f),
+            Math.Max(24f, viewportSize.Y - 108f));
+    }
+
+    private void HideSettingsButton()
+    {
+        if (IsValid(_settingsButton))
+        {
+            _settingsButton!.Visible = false;
+        }
+    }
+
+    /// <summary>
+    /// Godot C# 对象在底层节点释放后仍可能留下托管壳。
+    /// 统一用这个方法检查，避免保存退出/界面切换时 ObjectDisposedException 刷屏。
+    /// </summary>
+    private static bool IsValid(GodotObject? obj)
+    {
+        try
+        {
+            return obj != null && GodotObject.IsInstanceValid(obj);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
     }
 
     private static string GetLabelText(Control label)
@@ -134,30 +286,62 @@ public sealed partial class AutoChessSettingsUi : Node
         };
     }
 
-    private static bool IsThisModLabel(string text)
+    private static int GetAnchorScore(string text)
     {
-        return text.Contains("AutoChessTactics", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("自走棋战术", StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return 0;
+        }
+
+        // 描述文本优先级最高：它通常同时包含“利息 / 合成 / 刷新”这几个关键词。
+        if (text.Contains("利息", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("合成", StringComparison.OrdinalIgnoreCase)
+            && text.Contains("刷新", StringComparison.OrdinalIgnoreCase))
+        {
+            return 100;
+        }
+
+        if (text.Contains("自走棋式金币利息", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("商店刷新和卡牌合成", StringComparison.OrdinalIgnoreCase))
+        {
+            return 95;
+        }
+
+        if (text.Contains("AutoChessTactics", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("自走棋战术", StringComparison.OrdinalIgnoreCase))
+        {
+            return 70;
+        }
+
+        if (text.Contains("Author:", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Version:", StringComparison.OrdinalIgnoreCase))
+        {
+            return 40;
+        }
+
+        return 0;
     }
 
     private Button CreateSettingsButton()
     {
         var button = new Button
         {
-            Text = "自走棋设置",
+            // 和 AncientWaifus 的 Mod 页面设置入口保持相似：底部居中的文字按钮。
+            Text = "AutoChess Config (Settings)",
             Flat = true,
             MouseDefaultCursorShape = Control.CursorShape.PointingHand,
             TooltipText = "设置利息、合成、商店刷新和删牌费用",
         };
         button.AddThemeColorOverride("font_color", new Color(0.95f, 0.82f, 0.32f));
         button.AddThemeColorOverride("font_hover_color", Colors.White);
+        button.AddThemeFontSizeOverride("font_size", 28);
         button.Pressed += ShowPopup;
         return button;
     }
 
     private void ShowPopup()
     {
-        if (_popup == null || !GodotObject.IsInstanceValid(_popup))
+        if (!IsValid(_popup))
         {
             _popup = CreatePopup();
             if (Engine.GetMainLoop() is not SceneTree tree)
@@ -165,13 +349,14 @@ public sealed partial class AutoChessSettingsUi : Node
                 return;
             }
 
-            var layer = new CanvasLayer { Layer = 100 };
-            layer.AddChild(_popup);
-            tree.Root.AddChild(layer);
+            _popupLayer = new CanvasLayer { Layer = 100 };
+            _popupLayer.AddChild(_popup);
+            tree.Root.AddChild(_popupLayer);
         }
 
-        _popup.Visible = true;
-        _popup.MoveToFront();
+        PanelContainer popup = _popup!;
+        popup.Visible = true;
+        popup.MoveToFront();
     }
 
     private PanelContainer CreatePopup()

@@ -88,11 +88,19 @@ internal static class SelfTest
         Assert(
             HasAutoChessPostfix(typeof(CardModel).GetMethod(nameof(CardModel.CreateClone), Type.EmptyTypes)),
             "CardModel.CreateClone 缺少 AutoChess 星级复制补丁");
-        Assert(
-            HasAutoChessPostfix(typeof(CardModel).GetMethod(nameof(CardModel.CreateCloneForPlayer), new[] { typeof(Player) })),
-            "CardModel.CreateCloneForPlayer 缺少 AutoChess 星级复制补丁");
-        Assert(
-            HasAutoChessPostfix(typeof(CardModel).GetMethod(nameof(CardModel.CreateDupe), new[] { typeof(Player) })),
+        AssertPatchedIfExists(
+            "CreateCloneForPlayer",
+            new[] { typeof(Player) },
+            "CardModel.CreateCloneForPlayer 存在但缺少 AutoChess 星级复制补丁");
+        AssertAllCardMethodsPatched(
+            "CreateDupe",
+            method =>
+            {
+                ParameterInfo[] parameters = method.GetParameters();
+                return method.ReturnType == typeof(CardModel)
+                    && (parameters.Length == 0
+                        || (parameters.Length == 1 && parameters[0].ParameterType == typeof(Player)));
+            },
             "CardModel.CreateDupe 缺少 AutoChess 星级复制补丁");
         Assert(
             HasAutoChessPostfix(typeof(RunState).GetMethod(nameof(RunState.CloneCard), new[] { typeof(CardModel) })),
@@ -107,6 +115,38 @@ internal static class SelfTest
         Assert(method != null, "找不到需要检查的游戏方法");
         var patchInfo = Harmony.GetPatchInfo(method!);
         return patchInfo?.Postfixes.Any(patch => patch.owner == AutoChessTactics.HarmonyId) == true;
+    }
+
+    private static void AssertPatchedIfExists(string name, Type[] parameters, string message)
+    {
+        MethodInfo? method = typeof(CardModel).GetMethod(
+            name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            types: parameters,
+            modifiers: null);
+        if (method == null)
+        {
+            return;
+        }
+
+        Assert(HasAutoChessPostfix(method), message);
+    }
+
+    private static void AssertAllCardMethodsPatched(
+        string name,
+        Func<MethodInfo, bool> predicate,
+        string message)
+    {
+        MethodInfo[] methods = typeof(CardModel)
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .Where(method => method.Name == name && predicate(method))
+            .ToArray();
+        Assert(methods.Length > 0, "找不到需要检查的游戏方法：" + name);
+        foreach (MethodInfo method in methods)
+        {
+            Assert(HasAutoChessPostfix(method), message + "：" + method);
+        }
     }
 
     private static CardModel RequireCard(CardModel? card, string message)

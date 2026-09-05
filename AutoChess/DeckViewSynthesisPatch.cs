@@ -14,6 +14,7 @@ using MegaCrit.Sts2.Core.Logging;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.CommonUi;
+using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 
 namespace AutoChessTactics;
@@ -35,6 +36,8 @@ public static class DeckViewSynthesisPatch
 {
     /// <summary>每个运行界面只创建一个合成按钮。</summary>
     private static readonly ConditionalWeakTable<NRun, Button> _buttons = new();
+
+    private const string VisibilityTickerNodeName = "AutoChessSynthesisButtonVisibilityTicker";
 
     /// <summary>防止按钮连点导致同时打开两个卡牌选择 Overlay。</summary>
     private static bool _flowRunning;
@@ -99,12 +102,12 @@ public static class DeckViewSynthesisPatch
     /// </summary>
     private static void TryEnsureButton(NRun run)
     {
-        if (run == null || _buttons.TryGetValue(run, out _))
+        if (run == null || HasLiveButton(run))
         {
             return;
         }
 
-        if (run.GlobalUi != null)
+        if (IsValid(run.GlobalUi))
         {
             CreateButton(run);
             return;
@@ -117,12 +120,12 @@ public static class DeckViewSynthesisPatch
     {
         for (int i = 0; i < 30; i++)
         {
-            if (run == null || !GodotObject.IsInstanceValid(run))
+            if (!IsValid(run))
             {
                 return;
             }
 
-            if (run.GlobalUi != null)
+            if (IsValid(run.GlobalUi))
             {
                 CreateButton(run);
                 return;
@@ -134,7 +137,8 @@ public static class DeckViewSynthesisPatch
 
     private static void CreateButton(NRun run)
     {
-        if (run.GlobalUi == null || _buttons.TryGetValue(run, out _))
+        NGlobalUi? globalUi = run.GlobalUi;
+        if (!IsValid(globalUi) || HasLiveButton(run))
         {
             return;
         }
@@ -142,6 +146,7 @@ public static class DeckViewSynthesisPatch
         var button = new Button
         {
             Text = $"合成 ({AutoChessConfig.SynthesisCost}金币)",
+            Visible = false,
             MouseFilter = Control.MouseFilterEnum.Stop,
             ZIndex = 1000,
             // 黄色按钮，和商店刷新按钮保持一致但更醒目
@@ -149,10 +154,11 @@ public static class DeckViewSynthesisPatch
             TooltipText = "使用游戏标准选牌界面，选择两张相同卡牌进行合成",
         };
 
-        // GlobalUi 覆盖整个运行界面，按钮放在右上角，避开原版顶部资源栏。
-        button.SetAnchorsPreset(Control.LayoutPreset.TopRight);
-        button.Position = new Vector2(-290f, 76f);
-        button.CustomMinimumSize = new Vector2(270f, 42f);
+        // GlobalUi 覆盖整个运行界面。
+        // 按钮放在左上侧，避开顶栏血量/金币，同时满足“非战斗时随手可合成”的入口需求。
+        button.SetAnchorsPreset(Control.LayoutPreset.TopLeft);
+        button.Position = new Vector2(24f, 150f);
+        button.CustomMinimumSize = new Vector2(230f, 42f);
         button.Pressed += () =>
         {
             if (_flowRunning)
@@ -165,7 +171,8 @@ public static class DeckViewSynthesisPatch
             TaskHelper.RunSafely(SynthesisFlowAsync(button));
         };
 
-        run.GlobalUi.AddChild(button);
+        globalUi!.AddChild(button);
+        EnsureVisibilityTicker(globalUi);
         _buttons.Add(run, button);
         RefreshButtonVisibility();
     }
@@ -177,17 +184,105 @@ public static class DeckViewSynthesisPatch
     internal static void RefreshButtonVisibility()
     {
         NRun? run = NRun.Instance;
-        if (run == null || !_buttons.TryGetValue(run, out Button? button)
-            || button == null || !GodotObject.IsInstanceValid(button))
+        if (run == null)
         {
             return;
         }
 
-        bool mapOpen = run.GlobalUi?.MapScreen?.IsOpen == true;
-        bool inCombat = run.CombatRoom != null;
+        if (!_buttons.TryGetValue(run, out Button? button))
+        {
+            TryEnsureButton(run);
+            return;
+        }
+
+        if (!IsValid(button))
+        {
+            // 有些界面切换会重建 GlobalUi，旧按钮托管对象还在但底层节点没了。
+            // 从弱表移除后立即重建，避免“战斗结束后左上角没有合成按钮”。
+            _buttons.Remove(run);
+            TryEnsureButton(run);
+            return;
+        }
+
+        bool inCombat = IsLiveCombat(run);
         // 费用可在运行时设置，避免按钮仍显示旧价格。
-        button.Text = $"合成 ({AutoChessConfig.SynthesisCost}金币)";
-        button.Visible = mapOpen && !inCombat && !_flowRunning;
+        button!.Text = $"合成 ({AutoChessConfig.SynthesisCost}金币)";
+        button.Visible = !inCombat && !_flowRunning;
+        if (button.Visible)
+        {
+            button.MoveToFront();
+        }
+    }
+
+    /// <summary>
+    /// 只在真正的战斗过程中隐藏按钮。
+    /// 战斗结束奖励、地图、事件、休息、商店都允许打开合成。
+    /// </summary>
+    private static bool IsLiveCombat(NRun run)
+    {
+        try
+        {
+            RunState? runState = RunManager.Instance.DebugOnlyGetState();
+            if (runState?.CurrentRoom is CombatRoom combatRoom
+                && combatRoom.CombatState != null)
+            {
+                return combatRoom.CombatState.IsLiveCombat();
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 判断当前战斗状态失败：{e.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool HasLiveButton(NRun run)
+    {
+        if (!_buttons.TryGetValue(run, out Button? existing))
+        {
+            return false;
+        }
+
+        if (IsValid(existing))
+        {
+            return true;
+        }
+
+        _buttons.Remove(run);
+        return false;
+    }
+
+    private static void EnsureVisibilityTicker(NGlobalUi globalUi)
+    {
+        try
+        {
+            if (globalUi.GetNodeOrNull<Node>(VisibilityTickerNodeName) != null)
+            {
+                return;
+            }
+
+            globalUi.AddChild(new AutoChessSynthesisButtonVisibilityTicker
+            {
+                Name = VisibilityTickerNodeName,
+            });
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 创建合成按钮可见性刷新器失败：{e.Message}");
+        }
+    }
+
+    private static bool IsValid(GodotObject? obj)
+    {
+        try
+        {
+            return obj != null && GodotObject.IsInstanceValid(obj);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -319,5 +414,27 @@ public static class DeckViewSynthesisPatch
     {
         SynthesisService.RecoverStarFromValuesIfNeeded(card, "synthesis-ui", out _);
         return StarTracker.GetEffective(card);
+    }
+}
+
+/// <summary>
+/// 定时刷新合成按钮可见性。
+/// 有些界面切换不会触发地图 Open/Close（例如奖励、事件、SL 后恢复），
+/// 所以用一个很轻的 UI tick 兜底，避免按钮状态卡在旧界面。
+/// </summary>
+public sealed partial class AutoChessSynthesisButtonVisibilityTicker : Node
+{
+    private double _timer;
+
+    public override void _Process(double delta)
+    {
+        _timer += delta;
+        if (_timer < 0.25)
+        {
+            return;
+        }
+
+        _timer = 0;
+        DeckViewSynthesisPatch.RefreshButtonVisibility();
     }
 }

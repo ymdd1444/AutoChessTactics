@@ -1,11 +1,19 @@
 using System.Reflection;
 
-string root = args.Length > 0
+string requestedRoot = args.Length > 0
     ? Path.GetFullPath(args[0])
     : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
 
-string gameDir = Path.Combine(root, "data_sts2_windows_x86_64");
-string modProjectDir = Path.Combine(root, "moddev", "AutoChessTactics");
+// 兼容两种传参：
+//   1) 游戏根目录：...\Slay the Spire 2
+//   2) 直接传数据目录：...\data_sts2_windows_x86_64 或 beta 探针目录（里面有 sts2.dll）
+// 这样可以在本机同时验证正式版和 beta 版 DLL，不需要复制文件或改项目结构。
+string gameDir = File.Exists(Path.Combine(requestedRoot, "sts2.dll"))
+    ? requestedRoot
+    : Path.Combine(requestedRoot, "data_sts2_windows_x86_64");
+
+string modProjectDir = FindAncestorContaining(AppContext.BaseDirectory, "AutoChessTactics.csproj")
+    ?? Path.Combine(requestedRoot, "moddev", "AutoChessTactics");
 string modDll = Path.Combine(modProjectDir, ".godot", "mono", "temp", "bin", "Release", "AutoChessTactics.dll");
 
 if (!File.Exists(modDll))
@@ -55,3 +63,20 @@ Console.Write(result);
 return result.Contains("ALL TESTS PASSED", StringComparison.Ordinal)
     ? 0
     : 1;
+
+static string? FindAncestorContaining(string start, string markerFile)
+{
+    DirectoryInfo? dir = new DirectoryInfo(start);
+    while (dir != null)
+    {
+        string marker = Path.Combine(dir.FullName, markerFile);
+        if (File.Exists(marker))
+        {
+            return dir.FullName;
+        }
+
+        dir = dir.Parent;
+    }
+
+    return null;
+}

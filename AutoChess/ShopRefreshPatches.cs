@@ -29,6 +29,8 @@ namespace AutoChessTactics;
 /// </summary>
 public static class ShopRefreshPatches
 {
+    private const int MaxFreshInventoryRolls = 8;
+
     /// <summary>
     /// 每个库存界面的状态。
     /// Generation 让过期的异步刷新结果失效，InProgress 防止双击并发刷新。
@@ -128,11 +130,10 @@ public static class ShopRefreshPatches
     private static void EnsureRefreshButton(NMerchantInventory inventoryNode)
     {
         if (_states.TryGetValue(inventoryNode, out RefreshState? existing)
-            && existing.Button != null
-            && GodotObject.IsInstanceValid(existing.Button))
+            && IsValid(existing.Button))
         {
             // 设置可以在 Mod 管理界面中运行时修改，按钮文字也要同步更新。
-            existing.Button.Text = $"刷新商店 ({AutoChessConfig.ShopRefreshCost}金币)";
+            existing.Button!.Text = $"刷新商店 ({AutoChessConfig.ShopRefreshCost}金币)";
             return;
         }
 
@@ -171,10 +172,9 @@ public static class ShopRefreshPatches
     private static void SetButtonVisible(NMerchantInventory inventoryNode, bool visible)
     {
         if (_states.TryGetValue(inventoryNode, out RefreshState? state)
-            && state.Button != null
-            && GodotObject.IsInstanceValid(state.Button))
+            && IsValid(state.Button))
         {
-            state.Button.MoveToFront();
+            state.Button!.MoveToFront();
             state.Button.Visible = visible;
         }
     }
@@ -187,9 +187,9 @@ public static class ShopRefreshPatches
         }
 
         _states.Remove(inventoryNode);
-        if (state.Button != null && GodotObject.IsInstanceValid(state.Button))
+        if (IsValid(state.Button))
         {
-            state.Button.QueueFree();
+            state.Button!.QueueFree();
         }
     }
 
@@ -199,7 +199,7 @@ public static class ShopRefreshPatches
     /// </summary>
     private static async Task OnRefreshPressedAsync(NMerchantInventory inventoryNode)
     {
-        if (!GodotObject.IsInstanceValid(inventoryNode)
+        if (!IsValid(inventoryNode)
             || !_states.TryGetValue(inventoryNode, out RefreshState? state))
         {
             return;
@@ -232,10 +232,10 @@ public static class ShopRefreshPatches
             goldSpent = true;
 
             LogInventorySummary(oldInventory, "刷新前库存");
-            MerchantInventory fresh = MerchantInventory.CreateForNormalMerchant(player);
+            MerchantInventory fresh = CreateFreshInventory(player, oldInventory);
             LogInventorySummary(fresh, "生成新库存");
             if (generation != state.Generation
-                || !GodotObject.IsInstanceValid(inventoryNode)
+                || !IsValid(inventoryNode)
                 || !inventoryNode.IsInsideTree())
             {
                 throw new InvalidOperationException("商店刷新期间库存节点已失效。");
@@ -244,7 +244,7 @@ public static class ShopRefreshPatches
             Log.Debug(
                 $"[AutoChessTactics] 开始替换商店槽位：generation={generation}，" +
                 $"oldInventory={(oldInventory == null ? "null" : "valid")}。");
-            ApplyInventoryToExistingSlots(inventoryNode, fresh);
+            ApplyInventoryToExistingSlots(inventoryNode, fresh, ensureStocked: true);
 
             RunState? runState = RunManager.Instance.DebugOnlyGetState();
             if (runState?.CurrentRoom is MerchantRoom merchantRoom)
@@ -265,7 +265,7 @@ public static class ShopRefreshPatches
 
             try
             {
-                if (oldInventory != null && GodotObject.IsInstanceValid(inventoryNode))
+                if (oldInventory != null && IsValid(inventoryNode))
                 {
                     ApplyInventoryToExistingSlots(inventoryNode, oldInventory);
                 }
@@ -302,9 +302,14 @@ public static class ShopRefreshPatches
     /// </summary>
     private static void ApplyInventoryToExistingSlots(
         NMerchantInventory inventoryNode,
-        MerchantInventory inventory)
+        MerchantInventory inventory,
+        bool ensureStocked = false)
     {
         MerchantInventory? oldInventory = inventoryNode.Inventory;
+        if (ensureStocked)
+        {
+            EnsureInventoryFullyStocked(inventory);
+        }
 
         // 先解除旧库存的“购买完成/条目变化”回调。
         // 如果不做这一步，旧条目仍持有 NMerchantInventory 和槽位的委托；
@@ -339,19 +344,27 @@ public static class ShopRefreshPatches
             switch (slot)
             {
                 case NMerchantCard cardSlot when cardIndex < cards.Count:
+                    PrepareSlotForRefill(cardSlot);
                     cardSlot.FillSlot(cards[cardIndex++]);
+                    RestoreSlotIfStocked(cardSlot);
                     filledSlots++;
                     break;
                 case NMerchantRelic relicSlot when relicIndex < relics.Count:
+                    PrepareSlotForRefill(relicSlot);
                     relicSlot.FillSlot(relics[relicIndex++]);
+                    RestoreSlotIfStocked(relicSlot);
                     filledSlots++;
                     break;
                 case NMerchantPotion potionSlot when potionIndex < potions.Count:
+                    PrepareSlotForRefill(potionSlot);
                     potionSlot.FillSlot(potions[potionIndex++]);
+                    RestoreSlotIfStocked(potionSlot);
                     filledSlots++;
                     break;
                 case NMerchantCardRemoval removalSlot when inventory.CardRemovalEntry != null:
+                    PrepareSlotForRefill(removalSlot);
                     removalSlot.FillSlot(inventory.CardRemovalEntry);
+                    RestoreSlotIfStocked(removalSlot);
                     filledSlots++;
                     break;
             }
@@ -387,6 +400,7 @@ public static class ShopRefreshPatches
         }
 
         int detached = 0;
+        object? merchantDialogue = TryGetPrivateField<object>(inventoryNode, "_merchantDialogue");
         foreach (MerchantEntry entry in oldInventory.AllEntries)
         {
             detached += RemoveEventHandler(
@@ -394,6 +408,14 @@ public static class ShopRefreshPatches
                 nameof(MerchantEntry.PurchaseCompleted),
                 inventoryNode,
                 "OnPurchaseCompleted");
+            if (merchantDialogue != null)
+            {
+                detached += RemoveEventHandler(
+                    entry,
+                    nameof(MerchantEntry.PurchaseFailed),
+                    merchantDialogue,
+                    "ShowForPurchaseAttempt");
+            }
             detached += RemoveEventHandler(
                 entry,
                 nameof(MerchantEntry.EntryUpdated),
@@ -486,6 +508,207 @@ public static class ShopRefreshPatches
     }
 
     /// <summary>
+    /// 刷新前把售罄槽位恢复到“可重新展示”的基础状态。
+    ///
+    /// 原生卡牌/遗物/药水槽位在购买后会 Visible=false、MouseFilter=Ignore；
+    /// 但 FillSlot 只负责绑定新条目和刷新图像，不会把这些开关设回来。
+    /// 这正是“买了中间技能卡后刷新仍然空着”的原因。
+    /// </summary>
+    private static void PrepareSlotForRefill(NMerchantSlot slot)
+    {
+        try
+        {
+            slot.Visible = true;
+            slot.MouseFilter = Control.MouseFilterEnum.Stop;
+            slot.FocusMode = Control.FocusModeEnum.All;
+
+            Traverse.Create(slot).Field("_isHovered").SetValue(false);
+
+            // 删牌服务用 _isUnavailable 阻止重复播放“已使用”动画。
+            // 如果刷新的是一个全新删牌条目，必须先把这个锁复位。
+            if (slot is NMerchantCardRemoval)
+            {
+                Traverse.Create(slot).Field("_isUnavailable").SetValue(false);
+            }
+
+            Control? hitbox = TryGetPrivateField<Control>(slot, "_hitbox");
+            if (hitbox != null)
+            {
+                hitbox.MouseFilter = Control.MouseFilterEnum.Stop;
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 重置商店槽位显示状态失败（{slot.GetType().Name}）：{e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 如果新条目确实有货，强制恢复槽位显示。
+    /// 原生 UpdateVisual 在空货时会隐藏槽位，但有货路径没有对应的 Show。
+    /// </summary>
+    private static void RestoreSlotIfStocked(NMerchantSlot slot)
+    {
+        try
+        {
+            if (slot.Entry?.IsStocked == true)
+            {
+                slot.Visible = true;
+                slot.MouseFilter = Control.MouseFilterEnum.Stop;
+                slot.FocusMode = Control.FocusModeEnum.All;
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 恢复商店槽位可见性失败（{slot.GetType().Name}）：{e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 创建“尽量全新”的商店库存。
+    ///
+    /// 原生随机有可能在同一个槽位抽到和刷新前相同的卡/遗物/药水。
+    /// 刷新按钮的直觉是“整店换一批”，因此这里最多重抽几次；
+    /// 若卡池/遗物池太小导致无法完全避开旧商品，就使用差异最多的一组，避免卡死。
+    /// </summary>
+    private static MerchantInventory CreateFreshInventory(
+        Player player,
+        MerchantInventory? previousInventory)
+    {
+        MerchantInventory? best = null;
+        int bestSameSlots = int.MaxValue;
+
+        for (int attempt = 1; attempt <= MaxFreshInventoryRolls; attempt++)
+        {
+            MerchantInventory candidate = MerchantInventory.CreateForNormalMerchant(player);
+            EnsureInventoryFullyStocked(candidate);
+
+            int sameSlots = CountSameRefreshGoods(previousInventory, candidate);
+            if (sameSlots < bestSameSlots)
+            {
+                best = candidate;
+                bestSameSlots = sameSlots;
+            }
+
+            if (sameSlots == 0)
+            {
+                if (attempt > 1)
+                {
+                    Log.Debug($"[AutoChessTactics] 商店刷新第 {attempt} 次重抽后获得全新库存。");
+                }
+                return candidate;
+            }
+        }
+
+        if (best == null)
+        {
+            throw new InvalidOperationException("无法生成新的商店库存。");
+        }
+
+        if (bestSameSlots > 0)
+        {
+            Log.Warn(
+                $"[AutoChessTactics] 商店库存池可能较小，{MaxFreshInventoryRolls} 次重抽后仍有 {bestSameSlots} 个同槽位商品相同。");
+        }
+
+        return best;
+    }
+
+    private static int CountSameRefreshGoods(
+        MerchantInventory? previousInventory,
+        MerchantInventory nextInventory)
+    {
+        if (previousInventory == null)
+        {
+            return 0;
+        }
+
+        List<string> previous = GetRefreshGoodsSignature(previousInventory);
+        List<string> next = GetRefreshGoodsSignature(nextInventory);
+        int comparable = Math.Min(previous.Count, next.Count);
+        int same = 0;
+        for (int i = 0; i < comparable; i++)
+        {
+            if (string.Equals(previous[i], next[i], StringComparison.OrdinalIgnoreCase))
+            {
+                same++;
+            }
+        }
+        return same;
+    }
+
+    /// <summary>
+    /// 只比较刷新承诺会替换的商品：卡牌、遗物和药水。
+    /// 删牌服务是功能入口，不作为“同商品”判断，否则每次都会看起来有一个固定项。
+    /// </summary>
+    private static List<string> GetRefreshGoodsSignature(MerchantInventory inventory)
+    {
+        var signature = new List<string>();
+        signature.AddRange(inventory.CardEntries.Select(entry =>
+            "card:" + (entry.CreationResult?.Card.Id.Entry ?? "<empty>")));
+        signature.AddRange(inventory.RelicEntries.Select(entry =>
+            "relic:" + (entry.Model?.Id.Entry ?? "<empty>")));
+        signature.AddRange(inventory.PotionEntries.Select(entry =>
+            "potion:" + (entry.Model?.Id.Entry ?? "<empty>")));
+        return signature;
+    }
+
+    /// <summary>
+    /// 新商店库存理论上由 CreateForNormalMerchant 填满。
+    /// 这里再做一次保守校验：若某个条目被其它 Mod/Hook 清空，优先尝试原生补货；
+    /// 仍失败则抛出异常，由外层回滚并退款，避免留下半刷新 UI。
+    /// </summary>
+    private static void EnsureInventoryFullyStocked(MerchantInventory inventory)
+    {
+        int restocked = 0;
+        foreach (MerchantEntry entry in inventory.AllEntries)
+        {
+            if (entry.IsStocked)
+            {
+                continue;
+            }
+
+            if (TryRestockEntry(entry, inventory))
+            {
+                restocked++;
+            }
+        }
+
+        MerchantEntry? empty = inventory.AllEntries.FirstOrDefault(entry => !entry.IsStocked);
+        if (empty != null)
+        {
+            throw new InvalidOperationException(
+                $"新商店库存存在空条目：{empty.GetType().Name}。");
+        }
+
+        if (restocked > 0)
+        {
+            Log.Warn($"[AutoChessTactics] 新商店库存含空条目，已尝试原生补货：{restocked} 个。");
+        }
+    }
+
+    private static bool TryRestockEntry(MerchantEntry entry, MerchantInventory inventory)
+    {
+        try
+        {
+            if (entry is MerchantCardEntry cardEntry)
+            {
+                cardEntry.Populate();
+                return cardEntry.IsStocked;
+            }
+
+            MethodInfo? restock = FindInstanceMethod(entry.GetType(), "RestockAfterPurchase");
+            restock?.Invoke(entry, new object?[] { inventory });
+            return entry.IsStocked;
+        }
+        catch (Exception e)
+        {
+            Log.Warn($"[AutoChessTactics] 商店条目补货失败（{entry.GetType().Name}）：{e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
     /// 通过事件的 remove 访问器解除原生私有回调。
     ///
     /// 商店节点的回调方法在当前游戏版本是 private，直接写
@@ -564,6 +787,31 @@ public static class ShopRefreshPatches
         return null;
     }
 
+    private static T? TryGetPrivateField<T>(object target, string fieldName)
+        where T : class
+    {
+        try
+        {
+            return Traverse.Create(target).Field(fieldName).GetValue<T>();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsValid(GodotObject? obj)
+    {
+        try
+        {
+            return obj != null && GodotObject.IsInstanceValid(obj);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
     private static void LogInventorySummary(MerchantInventory? inventory, string context)
     {
         try
@@ -576,9 +824,18 @@ public static class ShopRefreshPatches
 
             string cards = string.Join(",",
                 inventory.CardEntries.Select(entry =>
-                    entry.CreationResult?.Card.Id.Entry ?? "<空>"));
+                    (entry.CreationResult?.Card.Id.Entry ?? "<空>")
+                    + (entry.IsStocked ? "" : "(售罄)")));
+            string relics = string.Join(",",
+                inventory.RelicEntries.Select(entry =>
+                    (entry.Model?.Id.Entry ?? "<空>")
+                    + (entry.IsStocked ? "" : "(售罄)")));
+            string potions = string.Join(",",
+                inventory.PotionEntries.Select(entry =>
+                    (entry.Model?.Id.Entry ?? "<空>")
+                    + (entry.IsStocked ? "" : "(售罄)")));
             Log.Info(
-                $"[AutoChessTactics] {context}：卡牌={cards}，遗物={inventory.RelicEntries.Count}，药水={inventory.PotionEntries.Count}。");
+                $"[AutoChessTactics] {context}：卡牌={cards}，遗物={relics}，药水={potions}，删牌={(inventory.CardRemovalEntry?.IsStocked == true ? "可用" : "不可用")}。");
         }
         catch (Exception e)
         {
