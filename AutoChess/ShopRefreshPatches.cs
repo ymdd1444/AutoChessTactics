@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Godot;
@@ -230,6 +231,7 @@ public static class ShopRefreshPatches
             await PlayerCmd.LoseGold(AutoChessConfig.ShopRefreshCost, player);
             goldSpent = true;
 
+            LogInventorySummary(oldInventory, "刷新前库存");
             MerchantInventory fresh = MerchantInventory.CreateForNormalMerchant(player);
             LogInventorySummary(fresh, "生成新库存");
             if (generation != state.Generation
@@ -239,7 +241,9 @@ public static class ShopRefreshPatches
                 throw new InvalidOperationException("商店刷新期间库存节点已失效。");
             }
 
-            // FillSlot 不会重复连接槽位自身的悬停信号，是当前版本安全的刷新路径。
+            Log.Debug(
+                $"[AutoChessTactics] 开始替换商店槽位：generation={generation}，" +
+                $"oldInventory={(oldInventory == null ? "null" : "valid")}。");
             ApplyInventoryToExistingSlots(inventoryNode, fresh);
 
             RunState? runState = RunManager.Instance.DebugOnlyGetState();
@@ -251,12 +255,6 @@ public static class ShopRefreshPatches
                     merchantRoom.Inventories[slot] = fresh;
                 }
             }
-
-            // NMerchantInventory 第一次 Initialize 时订阅旧库存。
-            // 替换 Inventory 属性不会自动订阅新条目，因此显式调用游戏自己的
-            // SubscribeToEntries，保证新库存购买后导航和商人对话仍正常工作。
-            Traverse.Create(inventoryNode).Method("SubscribeToEntries").GetValue();
-            Log.Debug($"[AutoChessTactics] 新库存事件已重新订阅，generation={generation}。");
 
             UiToast.Show("商店已刷新！");
             Log.Info($"[AutoChessTactics] 商店刷新成功：玩家 {player.NetId}，generation={generation}。");
@@ -306,6 +304,24 @@ public static class ShopRefreshPatches
         NMerchantInventory inventoryNode,
         MerchantInventory inventory)
     {
+        MerchantInventory? oldInventory = inventoryNode.Inventory;
+
+        // 先解除旧库存的“购买完成/条目变化”回调。
+        // 如果不做这一步，旧条目仍持有 NMerchantInventory 和槽位的委托；
+        // 连续刷新后购买一次商品会触发多套旧回调，严重时会访问已释放节点。
+        DetachInventoryCallbacks(inventoryNode, oldInventory);
+
+        // FillSlot 会连接当前商品条目的回调，但不会替我们清理上一次
+        // FillSlot 连接的旧条目，因此必须按槽位类型逐一拆除。
+        int detachedSlots = 0;
+        foreach (NMerchantSlot slot in inventoryNode.GetAllSlots())
+        {
+            if (DetachSlotCallbacks(slot))
+            {
+                detachedSlots++;
+            }
+        }
+
         Traverse.Create(inventoryNode)
             .Property(nameof(NMerchantInventory.Inventory))
             .SetValue(inventory);
@@ -317,21 +333,26 @@ public static class ShopRefreshPatches
         int relicIndex = 0;
         int potionIndex = 0;
 
+        int filledSlots = 0;
         foreach (NMerchantSlot slot in inventoryNode.GetAllSlots())
         {
             switch (slot)
             {
                 case NMerchantCard cardSlot when cardIndex < cards.Count:
                     cardSlot.FillSlot(cards[cardIndex++]);
+                    filledSlots++;
                     break;
                 case NMerchantRelic relicSlot when relicIndex < relics.Count:
                     relicSlot.FillSlot(relics[relicIndex++]);
+                    filledSlots++;
                     break;
                 case NMerchantPotion potionSlot when potionIndex < potions.Count:
                     potionSlot.FillSlot(potions[potionIndex++]);
+                    filledSlots++;
                     break;
                 case NMerchantCardRemoval removalSlot when inventory.CardRemovalEntry != null:
                     removalSlot.FillSlot(inventory.CardRemovalEntry);
+                    filledSlots++;
                     break;
             }
         }
@@ -342,19 +363,221 @@ public static class ShopRefreshPatches
                 $"商店槽位数量不匹配：卡牌 {cardIndex}/{cards.Count}，遗物 {relicIndex}/{relics.Count}，药水 {potionIndex}/{potions.Count}。");
         }
 
+        // Inventory.Initialize 只允许首次初始化；这里调用的是私有的
+        // SubscribeToEntries，仅为新库存挂上一次事件，不会重复初始化槽位信号。
+        Traverse.Create(inventoryNode).Method("SubscribeToEntries").GetValue();
+
         Traverse.Create(inventoryNode).Method("UpdateNavigation").GetValue();
         Log.Debug(
-            $"[AutoChessTactics] 商店 UI 已安全重填：卡牌 {cards.Count}，遗物 {relics.Count}，药水 {potions.Count}。");
+            $"[AutoChessTactics] 商店 UI 已安全重填：卡牌 {cards.Count}，遗物 {relics.Count}，" +
+            $"药水 {potions.Count}，填充槽位={filledSlots}，解除旧槽位回调={detachedSlots}。");
     }
 
-    private static void LogInventorySummary(MerchantInventory inventory, string context)
+    /// <summary>
+    /// 解除 NMerchantInventory 对旧库存的订阅。
+    /// 事件是 Action 委托，使用 -= 是幂等的，重复调用不会抛异常。
+    /// </summary>
+    private static void DetachInventoryCallbacks(
+        NMerchantInventory inventoryNode,
+        MerchantInventory? oldInventory)
+    {
+        if (oldInventory == null)
+        {
+            return;
+        }
+
+        int detached = 0;
+        foreach (MerchantEntry entry in oldInventory.AllEntries)
+        {
+            detached += RemoveEventHandler(
+                entry,
+                nameof(MerchantEntry.PurchaseCompleted),
+                inventoryNode,
+                "OnPurchaseCompleted");
+            detached += RemoveEventHandler(
+                entry,
+                nameof(MerchantEntry.EntryUpdated),
+                inventoryNode,
+                "UpdateNavigation");
+        }
+
+        if (detached > 0)
+        {
+            Log.Debug($"[AutoChessTactics] 已解除旧库存事件订阅：条目数={detached}。");
+        }
+    }
+
+    /// <summary>
+    /// 解除一个槽位当前条目的所有回调。
+    ///
+    /// 这些字段是原生槽位的私有字段，使用 Traverse 读取是为了兼容
+    /// 当前版本的封装；不修改原生程序集，也不重新调用 Initialize。
+    /// </summary>
+    private static bool DetachSlotCallbacks(NMerchantSlot slot)
     {
         try
         {
+            MerchantEntry? oldEntry = slot switch
+            {
+                NMerchantCard card => Traverse.Create(card).Field("_cardEntry").GetValue<MerchantCardEntry>(),
+                NMerchantPotion potion => Traverse.Create(potion).Field("_potionEntry").GetValue<MerchantPotionEntry>(),
+                NMerchantRelic relic => Traverse.Create(relic).Field("_relicEntry").GetValue<MerchantRelicEntry>(),
+                NMerchantCardRemoval removal => Traverse.Create(removal).Field("_removalEntry").GetValue<MerchantCardRemovalEntry>(),
+                _ => null,
+            };
+
+            if (oldEntry == null)
+            {
+                return false;
+            }
+
+            int removed = 0;
+            removed += RemoveEventHandler(
+                oldEntry,
+                nameof(MerchantEntry.EntryUpdated),
+                slot,
+                "UpdateVisual");
+            removed += RemoveEventHandler(
+                oldEntry,
+                nameof(MerchantEntry.PurchaseFailed),
+                slot,
+                "OnPurchaseFailed");
+
+            switch (slot)
+            {
+                case NMerchantCard card:
+                    removed += RemoveEventHandler(
+                        oldEntry,
+                        nameof(MerchantEntry.PurchaseCompleted),
+                        card,
+                        "OnSuccessfulPurchase");
+                    break;
+                case NMerchantPotion potion:
+                    removed += RemoveEventHandler(
+                        oldEntry,
+                        nameof(MerchantEntry.PurchaseCompleted),
+                        potion,
+                        "OnSuccessfulPurchase");
+                    break;
+                case NMerchantRelic relic:
+                    removed += RemoveEventHandler(
+                        oldEntry,
+                        nameof(MerchantEntry.PurchaseCompleted),
+                        relic,
+                        "OnSuccessfulPurchase");
+                    break;
+                case NMerchantCardRemoval removal:
+                    removed += RemoveEventHandler(
+                        oldEntry,
+                        nameof(MerchantEntry.PurchaseCompleted),
+                        removal,
+                        "OnSuccessfulPurchase");
+                    break;
+            }
+
+            return removed > 0;
+        }
+        catch (Exception e)
+        {
+            Log.Warn(
+                $"[AutoChessTactics] 解除商店槽位旧回调失败（{slot.GetType().Name}）：{e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 通过事件的 remove 访问器解除原生私有回调。
+    ///
+    /// 商店节点的回调方法在当前游戏版本是 private，直接写
+    /// entry.EntryUpdated -= slot.UpdateVisual 会无法编译。
+    /// 这里沿继承链查找真实方法，再按事件声明的委托类型创建同一个方法委托，
+    /// 因此可以安全地重复调用，且不会影响新槽位后续的 FillSlot。
+    /// </summary>
+    private static int RemoveEventHandler(
+        MerchantEntry entry,
+        string eventName,
+        object target,
+        string methodName)
+    {
+        try
+        {
+            EventInfo? eventInfo = typeof(MerchantEntry).GetEvent(
+                eventName,
+                BindingFlags.Instance | BindingFlags.Public);
+            if (eventInfo?.EventHandlerType == null)
+            {
+                return 0;
+            }
+            Type handlerType = eventInfo.EventHandlerType;
+
+            MethodInfo? method = FindInstanceMethod(target.GetType(), methodName);
+            if (method == null)
+            {
+                return 0;
+            }
+
+            Delegate? callback = Delegate.CreateDelegate(
+                handlerType,
+                target,
+                method,
+                true);
+            if (callback == null)
+            {
+                return 0;
+            }
+            MethodInfo? removeMethod = eventInfo.GetRemoveMethod(true);
+            if (removeMethod == null)
+            {
+                return 0;
+            }
+
+            removeMethod.Invoke(entry, new object[] { callback });
+            return 1;
+        }
+        catch (Exception e)
+        {
+            // 某些版本可能没有某一类回调；解绑失败不应阻止刷新，
+            // 但保留日志便于确认是否需要新增版本适配。
+            Log.Debug(
+                $"[AutoChessTactics] 解除事件回调失败：{eventName}/{methodName}，{e.Message}");
+            return 0;
+        }
+    }
+
+    /// <summary>沿类型继承链查找 private/protected/public 实例方法。</summary>
+    private static MethodInfo? FindInstanceMethod(Type type, string methodName)
+    {
+        for (Type? current = type;
+             current != null;
+             current = current.BaseType)
+        {
+            MethodInfo? method = current.GetMethod(
+                methodName,
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
+                | BindingFlags.DeclaredOnly);
+            if (method != null)
+            {
+                return method;
+            }
+        }
+
+        return null;
+    }
+
+    private static void LogInventorySummary(MerchantInventory? inventory, string context)
+    {
+        try
+        {
+            if (inventory == null)
+            {
+                Log.Info($"[AutoChessTactics] {context}：库存为空。");
+                return;
+            }
+
             string cards = string.Join(",",
                 inventory.CardEntries.Select(entry =>
                     entry.CreationResult?.Card.Id.Entry ?? "<空>"));
-            Log.Debug(
+            Log.Info(
                 $"[AutoChessTactics] {context}：卡牌={cards}，遗物={inventory.RelicEntries.Count}，药水={inventory.PotionEntries.Count}。");
         }
         catch (Exception e)
