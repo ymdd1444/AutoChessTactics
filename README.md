@@ -24,20 +24,7 @@
 
 设置修改后立即保存。
 
-## 构建
 
-在工程目录执行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
-```
-
-离线自测：
-
-```powershell
-& "$env:USERPROFILE\.dotnet\dotnet.exe" run `
-  --project SelfTestRunner\SelfTestRunner.csproj `
-  -c Release -- "D:\SteamLibrary\steamapps\common\Slay the Spire 2"
 ```
 
 ## 更新说明
