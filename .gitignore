@@ -21,3 +21,6 @@ obj/
 *.pdb
 *.deps.json
 *.runtimeconfig.json
+
+# Release zip is committed for GitHub downloads; expanded folders are local build output.
+release/v*/

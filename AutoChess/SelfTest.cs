@@ -47,7 +47,12 @@ internal static class SelfTest
         Run(sb, ref failures, "读档补丁兼容重复星级键（取最高星）", TestLoadPatchDuplicateStars);
         Run(sb, ref failures, "标题星级后缀（★★★）", TestTitlePatch);
         Run(sb, ref failures, "SPECIAL 卡规则（复杂/召唤/结构/状态）", TestSpecialRules);
+        Run(sb, ref failures, "Osty 卡攻击/召唤/恢复按星级缩放", TestOstyScalingRules);
+        Run(sb, ref failures, "储君特殊卡 Forge/Gold 按星级缩放", TestRegentSpecialValueScaling);
+        Run(sb, ref failures, "天际钻头升星不抬高 4 费触发阈值", TestHeavenlyDrillKeepsEnergyThreshold);
+        Run(sb, ref failures, "巨镰/遗传算法升星后保留永久成长", TestPersistentGrowthCardsKeepScaling);
         Run(sb, ref failures, "附魔兼容性（同类型同数量）", TestEnchantmentCompatibility);
+        Run(sb, ref failures, "自定义稀有度权重归一化", TestCardRarityWeights);
 
         sb.AppendLine(failures == 0 ? "ALL TESTS PASSED" : failures + " TEST(S) FAILED");
         return sb.ToString();
@@ -108,6 +113,15 @@ internal static class SelfTest
         Assert(
             HasAutoChessPostfix(typeof(CombatState).GetMethod(nameof(CombatState.CloneCard), new[] { typeof(CardModel) })),
             "CombatState.CloneCard 缺少 AutoChess 星级复制补丁");
+
+        MethodInfo? onPlayWrapper = typeof(CardModel)
+            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .FirstOrDefault(method =>
+                method.Name == nameof(CardModel.OnPlayWrapper)
+                && method.ReturnType.FullName == "System.Threading.Tasks.Task");
+        Assert(
+            HasAutoChessPostfixFrom(onPlayWrapper, "PersistentGrowthOnPlayWrapperPatch"),
+            "CardModel.OnPlayWrapper 缺少巨镰/遗传算法出牌后星级归一补丁");
     }
 
     private static bool HasAutoChessPostfix(MethodBase? method)
@@ -115,6 +129,15 @@ internal static class SelfTest
         Assert(method != null, "找不到需要检查的游戏方法");
         var patchInfo = Harmony.GetPatchInfo(method!);
         return patchInfo?.Postfixes.Any(patch => patch.owner == AutoChessTactics.HarmonyId) == true;
+    }
+
+    private static bool HasAutoChessPostfixFrom(MethodBase? method, string patchDeclaringTypeName)
+    {
+        Assert(method != null, "找不到需要检查的游戏方法");
+        var patchInfo = Harmony.GetPatchInfo(method!);
+        return patchInfo?.Postfixes.Any(patch =>
+            patch.owner == AutoChessTactics.HarmonyId
+            && patch.PatchMethod?.DeclaringType?.Name == patchDeclaringTypeName) == true;
     }
 
     private static void AssertPatchedIfExists(string name, Type[] parameters, string message)
@@ -502,7 +525,8 @@ internal static class SelfTest
         Assert(SynthesisDatabase.IsSpecialEntry("beckon"), "召唤卡必须在 SPECIAL 列表中");
         Assert(SynthesisDatabase.IsSpecialEntry("discovery"), "选择卡必须在 SPECIAL 列表中");
         Assert(SynthesisDatabase.IsSpecialEntry("trash_to_treasure"), "结构卡必须在 SPECIAL 列表中");
-        Assert(SynthesisDatabase.IsSpecialEntry("afterlife"), "状态卡必须在 SPECIAL 列表中");
+        Assert(SynthesisDatabase.IsSpecialEntry("afterlife"), "Osty 召唤卡必须在 SPECIAL 列表中");
+        Assert(SynthesisDatabase.IsSpecialEntry("calamity"), "状态卡必须在 SPECIAL 列表中");
 
         Assert(
             SynthesisDatabase.GetRule("beckon").Policy == SynthesisCardPolicy.Summoner,
@@ -514,13 +538,170 @@ internal static class SelfTest
             SynthesisDatabase.GetRule("trash_to_treasure").Policy == SynthesisCardPolicy.DeckStructure,
             "trash_to_treasure 应使用 DeckStructure 策略");
         Assert(
-            SynthesisDatabase.GetRule("afterlife").Policy == SynthesisCardPolicy.StatefulEvent,
-            "afterlife 应使用 StatefulEvent 策略");
+            SynthesisDatabase.GetRule("afterlife").Policy == SynthesisCardPolicy.Summoner,
+            "afterlife 的 Summon 是 Osty 生命/召唤强度，应使用 Summoner 策略");
+        Assert(
+            SynthesisDatabase.GetRule("calamity").Policy == SynthesisCardPolicy.StatefulEvent,
+            "calamity 应使用 StatefulEvent 策略");
         Assert(
             !SynthesisDatabase.ShouldScaleDynamicVar(
                 NewCard<Zap>(),
                 "Repeat"),
             "球类卡的 Repeat 不应被通用缩放");
+    }
+
+    private static void TestOstyScalingRules()
+    {
+        using var _ = new ModelDbScope();
+
+        // OstyDamage 是奥斯提本人攻击的伤害变量；旧规则只认 Damage，因此 SPECIAL 攻击卡不会涨数值。
+        var poke = NewCard<Poke>();
+        SynthesisService.ApplyStarScaling(poke, 2);
+        Assert(poke.DynamicVars.OstyDamage.BaseValue == 9m,
+            "二星 Poke/OstyDamage 应为 9，实际 " + poke.DynamicVars.OstyDamage.BaseValue);
+
+        var upgradedPoke = NewCard<Poke>();
+        upgradedPoke.UpgradeInternal();
+        SynthesisService.ApplyStarScaling(upgradedPoke, 2);
+        Assert(upgradedPoke.DynamicVars.OstyDamage.BaseValue == 13m,
+            "二星 Poke+ 应先升级到 9 再乘 1.5，实际 " + upgradedPoke.DynamicVars.OstyDamage.BaseValue);
+
+        // SummonVar 在 OstyCmd.Summon 中表示召唤/增加的生命值，不是额外召唤次数，因此可以安全按星级缩放。
+        var bodyguard = NewCard<Bodyguard>();
+        SynthesisService.ApplyStarScaling(bodyguard, 2);
+        Assert(bodyguard.DynamicVars.Summon.BaseValue == 7m,
+            "二星 Bodyguard/Summon 应为 7，实际 " + bodyguard.DynamicVars.Summon.BaseValue);
+
+        var reanimate = NewCard<Reanimate>();
+        SynthesisService.ApplyStarScaling(reanimate, 3);
+        Assert(reanimate.DynamicVars.Summon.BaseValue == 60m,
+            "三星 Reanimate/Summon 应为 60，实际 " + reanimate.DynamicVars.Summon.BaseValue);
+
+        // Spur 同时有召唤和恢复两个变量，两者都应按同一星级倍率处理。
+        var spur = NewCard<Spur>();
+        SynthesisService.ApplyStarScaling(spur, 2);
+        Assert(spur.DynamicVars.Summon.BaseValue == 4m,
+            "二星 Spur/Summon 应为 4，实际 " + spur.DynamicVars.Summon.BaseValue);
+        Assert(spur.DynamicVars.Heal.BaseValue == 7m,
+            "二星 Spur/Heal 应为 7，实际 " + spur.DynamicVars.Heal.BaseValue);
+
+        // 公式型 Osty 攻击只放大基础项，不改变“按 Osty 生命/卡牌数量计算”的触发逻辑。
+        var protector = NewCard<Protector>();
+        SynthesisService.ApplyStarScaling(protector, 3);
+        Assert(protector.DynamicVars.CalculationBase.BaseValue == 30m,
+            "三星 Protector/CalculationBase 应为 30，实际 " + protector.DynamicVars.CalculationBase.BaseValue);
+        Assert(protector.DynamicVars.ExtraDamage.BaseValue == 3m,
+            "三星 Protector/ExtraDamage 应为 3，实际 " + protector.DynamicVars.ExtraDamage.BaseValue);
+    }
+
+    private static void TestRegentSpecialValueScaling()
+    {
+        using var _ = new ModelDbScope();
+
+        var smith = NewCard<TheSmith>();
+        SynthesisService.ApplyStarScaling(smith, 2);
+        Assert(smith.DynamicVars.Forge.BaseValue == 45m,
+            "二星铸剑者 Forge 应为 45，实际 " + smith.DynamicVars.Forge.BaseValue);
+
+        var upgradedSmith = NewCard<TheSmith>();
+        upgradedSmith.UpgradeInternal();
+        SynthesisService.ApplyStarScaling(upgradedSmith, 2);
+        Assert(upgradedSmith.DynamicVars.Forge.BaseValue == 60m,
+            "二星铸剑者+ 应先升级到 40 再乘 1.5，实际 " + upgradedSmith.DynamicVars.Forge.BaseValue);
+
+        var royalties = NewCard<Royalties>();
+        SynthesisService.ApplyStarScaling(royalties, 3);
+        Assert(royalties.DynamicVars.Gold.BaseValue == 90m,
+            "三星王国资产 Gold 应为 90，实际 " + royalties.DynamicVars.Gold.BaseValue);
+    }
+
+    private static void TestHeavenlyDrillKeepsEnergyThreshold()
+    {
+        using var _ = new ModelDbScope();
+
+        var drill = NewCard<HeavenlyDrill>();
+        SynthesisService.ApplyStarScaling(drill, 2);
+
+        Assert(drill.DynamicVars.Damage.BaseValue == 12m,
+            "二星天际钻头伤害应为 12，实际 " + drill.DynamicVars.Damage.BaseValue);
+        Assert(drill.DynamicVars.Energy.BaseValue == 4m,
+            "天际钻头的 4 费触发阈值不应随星级变成 6/12，实际 " + drill.DynamicVars.Energy.BaseValue);
+        Assert(!SynthesisDatabase.ShouldScaleDynamicVar(drill, "Energy"),
+            "heavenly_drill 的 Energy 是阈值，不应被星级缩放");
+
+        SynthesisService.ApplyStarScaling(drill, 3);
+        Assert(drill.DynamicVars.Damage.BaseValue == 24m,
+            "三星天际钻头伤害应为 24，实际 " + drill.DynamicVars.Damage.BaseValue);
+        Assert(drill.DynamicVars.Energy.BaseValue == 4m,
+            "三星天际钻头仍应保持 4 费阈值，实际 " + drill.DynamicVars.Energy.BaseValue);
+    }
+
+    private static void TestPersistentGrowthCardsKeepScaling()
+    {
+        using var _ = new ModelDbScope();
+
+        var genetic = NewCard<GeneticAlgorithm>();
+        StarTracker.Set(genetic, 2);
+        SynthesisService.ApplyStarScaling(genetic, 2);
+        Assert(genetic.DynamicVars.Block.BaseValue == 1m,
+            "二星遗传算法初始格挡 floor(1*1.5) 应为 1，实际 " + genetic.DynamicVars.Block.BaseValue);
+        Assert(genetic.DynamicVars["Increase"].BaseValue == 4m,
+            "二星遗传算法成长量 floor(3*1.5) 应为 4，实际 " + genetic.DynamicVars["Increase"].BaseValue);
+
+        InvokeBuffFromPlay(genetic, genetic.DynamicVars["Increase"].IntValue);
+        SynthesisService.NormalizeStarCard(genetic);
+        Assert(ReadIntProperty(genetic, "CurrentBlock") == 5,
+            "遗传算法使用后 CurrentBlock 应保留原生成长字段 5");
+        Assert(genetic.DynamicVars.Block.BaseValue == 7m,
+            "遗传算法使用后重套二星应为 floor(5*1.5)=7，实际 " + genetic.DynamicVars.Block.BaseValue);
+
+        var scythe = NewCard<TheScythe>();
+        StarTracker.Set(scythe, 2);
+        SynthesisService.ApplyStarScaling(scythe, 2);
+        Assert(scythe.DynamicVars.Damage.BaseValue == 19m,
+            "二星巨镰初始伤害 floor(13*1.5) 应为 19，实际 " + scythe.DynamicVars.Damage.BaseValue);
+        Assert(scythe.DynamicVars["Increase"].BaseValue == 7m,
+            "二星巨镰成长量 floor(5*1.5) 应为 7，实际 " + scythe.DynamicVars["Increase"].BaseValue);
+
+        InvokeBuffFromPlay(scythe, scythe.DynamicVars["Increase"].IntValue);
+        SynthesisService.NormalizeStarCard(scythe);
+        Assert(ReadIntProperty(scythe, "CurrentDamage") == 20,
+            "巨镰使用后 CurrentDamage 应保留原生成长字段 20");
+        Assert(scythe.DynamicVars.Damage.BaseValue == 30m,
+            "巨镰使用后重套二星应为 floor(20*1.5)=30，实际 " + scythe.DynamicVars.Damage.BaseValue);
+
+        var grownSource = NewCard<TheScythe>();
+        InvokeBuffFromPlay(grownSource, grownSource.DynamicVars["Increase"].IntValue);
+        CardModel synthesized = RequireCard(
+            SynthesisService.CreateSynthesisCard(grownSource, 2),
+            "已成长巨镰合成时不应丢失成长字段");
+        Assert(ReadIntProperty(synthesized, "CurrentDamage") == 18,
+            "合成后的巨镰应保留源卡 CurrentDamage=18");
+        Assert(synthesized.DynamicVars.Damage.BaseValue == 27m,
+            "已成长巨镰合成二星后应为 floor(18*1.5)=27，实际 " + synthesized.DynamicVars.Damage.BaseValue);
+    }
+
+    private static void InvokeBuffFromPlay(CardModel card, int amount)
+    {
+        MethodInfo? method = card.GetType().GetMethod(
+            "BuffFromPlay",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert(method != null, card.Id.Entry + " 找不到 BuffFromPlay 测试入口");
+        method!.Invoke(card, new object[] { amount });
+    }
+
+    private static int ReadIntProperty(CardModel card, string propertyName)
+    {
+        PropertyInfo? property = card.GetType().GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        Assert(property != null, card.Id.Entry + " 找不到 " + propertyName + " 属性");
+        object? value = property!.GetValue(card);
+        if (value is int intValue)
+        {
+            return intValue;
+        }
+        throw new Exception(propertyName + " 应为 int，实际 " + (value?.GetType().Name ?? "null"));
     }
 
     private static void TestEnchantmentCompatibility()
@@ -554,6 +735,34 @@ internal static class SelfTest
             "相同类型但数量不同的附魔不能合成");
     }
 
+    private static void TestCardRarityWeights()
+    {
+        bool oldEnabled = AutoChessConfig.CustomCardRarityEnabled;
+        int oldCommon = AutoChessConfig.CustomCardRarityCommonPercent;
+        int oldUncommon = AutoChessConfig.CustomCardRarityUncommonPercent;
+        int oldRare = AutoChessConfig.CustomCardRarityRarePercent;
+
+        try
+        {
+            AutoChessConfig.CustomCardRarityEnabled = true;
+            AutoChessConfig.CustomCardRarityCommonPercent = 1;
+            AutoChessConfig.CustomCardRarityUncommonPercent = 1;
+            AutoChessConfig.CustomCardRarityRarePercent = 98;
+
+            var weights = AutoChessConfig.GetCustomCardRarityWeights();
+            Assert(Math.Abs(weights.Common + weights.Uncommon + weights.Rare - 1f) < 0.0001f,
+                "自定义稀有度权重应归一化为 1");
+            Assert(weights.Rare > 0.97f, "98 权重的金卡应占绝对大头");
+        }
+        finally
+        {
+            AutoChessConfig.CustomCardRarityEnabled = oldEnabled;
+            AutoChessConfig.CustomCardRarityCommonPercent = oldCommon;
+            AutoChessConfig.CustomCardRarityUncommonPercent = oldUncommon;
+            AutoChessConfig.CustomCardRarityRarePercent = oldRare;
+        }
+    }
+
     private static void Assert(bool cond, string msg)
     {
         if (!cond)
@@ -570,6 +779,16 @@ internal static class SelfTest
             typeof(StrikeSilent),
             typeof(Zap),
             typeof(Sharp),
+            typeof(Bodyguard),
+            typeof(Poke),
+            typeof(Protector),
+            typeof(Reanimate),
+            typeof(Spur),
+            typeof(TheSmith),
+            typeof(Royalties),
+            typeof(HeavenlyDrill),
+            typeof(GeneticAlgorithm),
+            typeof(TheScythe),
         };
 
         private readonly System.Collections.Generic.List<Type> _injectedByTest = new();

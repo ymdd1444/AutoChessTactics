@@ -374,6 +374,10 @@ public static class SynthesisService
                 throw new InvalidOperationException("[AutoChessTactics] 没有创建独立卡实例，拒绝原地合成。" + createError);
             }
 
+            // 巨镰/遗传算法这类卡的永久成长不是普通升级，而是存在卡牌自己的
+            // SavedProperty 字段里。新建合成卡时必须先把这些字段复制过去，
+            // 后面的星级缩放才会以“已成长的一星基准”计算。
+            CopyPersistentGrowthState(source, result);
             StarTracker.Set(result, star);
             ApplyStarScaling(result, star);
             // 先尝试补回附魔，再做星级重算。附魔复制如果失败，外层事务会回滚。
@@ -882,6 +886,11 @@ public static class SynthesisService
                 }
             });
 
+            // 有些卡会在使用后永久改写自己的 SavedProperty：
+            //   - GeneticAlgorithm：CurrentBlock / IncreasedBlock
+            //   - TheScythe：CurrentDamage / IncreasedDamage
+            // 如果这里只拿 ModelDb 模板，后续任何一次归一都会把成长洗回初始值。
+            CopyPersistentGrowthState(card, baseCard);
             return baseCard;
         }
         catch (Exception e)
@@ -961,6 +970,7 @@ public static class SynthesisService
                 }
             });
 
+            CopyPersistentGrowthState(card, reference);
             // 先写入“基础卡星级值”，此时 reference 还没有附魔。
             ApplyScaledValues(reference, baseCard, targetStar);
 
@@ -1025,6 +1035,197 @@ public static class SynthesisService
             Log.Warn($"[AutoChessTactics] ClonePreservingMutability 复制附魔失败，回退到序列化：{e.Message}");
             return EnchantmentModel.FromSerializable(source.ToSerializable());
         }
+    }
+
+    /// <summary>判断是否是“使用后永久成长”的卡。</summary>
+    private static bool IsPersistentGrowthCard(CardModel? card)
+    {
+        string? entry = card?.Id.Entry;
+        return entry != null
+            && (entry.Equals("genetic_algorithm", StringComparison.OrdinalIgnoreCase)
+                || entry.Equals("the_scythe", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>返回成长卡需要同步的 SavedProperty 字段名。</summary>
+    private static bool TryGetPersistentGrowthProperties(
+        CardModel card,
+        out string currentProperty,
+        out string increasedProperty)
+    {
+        currentProperty = string.Empty;
+        increasedProperty = string.Empty;
+
+        string? entry = card?.Id.Entry;
+        if (entry == null)
+        {
+            return false;
+        }
+
+        if (entry.Equals("genetic_algorithm", StringComparison.OrdinalIgnoreCase))
+        {
+            currentProperty = "CurrentBlock";
+            increasedProperty = "IncreasedBlock";
+            return true;
+        }
+        if (entry.Equals("the_scythe", StringComparison.OrdinalIgnoreCase))
+        {
+            currentProperty = "CurrentDamage";
+            increasedProperty = "IncreasedDamage";
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 复制巨镰/遗传算法的永久成长字段。
+    ///
+    /// 这些字段不是 DynamicVars 的简单一部分：
+    /// 原版出牌后会先写 CurrentDamage/CurrentBlock，再顺手把 DynamicVar 改成一星值。
+    /// 我们复制字段后再重套星级，才能让“升星 + 后续成长 + 读档/克隆”同时成立。
+    /// </summary>
+    private static void CopyPersistentGrowthState(CardModel source, CardModel target)
+    {
+        try
+        {
+            if (source == null || target == null || !IsPersistentGrowthCard(source))
+            {
+                return;
+            }
+            if (!string.Equals(source.Id.Entry, target.Id.Entry, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            if (!TryGetPersistentGrowthProperties(source, out string currentProperty, out string increasedProperty))
+            {
+                return;
+            }
+
+            CardModel stateSource = FindBestPersistentGrowthStateSource(source, increasedProperty);
+            if (TryReadIntProperty(stateSource, increasedProperty, out int increasedValue))
+            {
+                TryWriteIntProperty(target, increasedProperty, increasedValue);
+            }
+            if (TryReadIntProperty(stateSource, currentProperty, out int currentValue))
+            {
+                TryWriteIntProperty(target, currentProperty, currentValue);
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Debug($"[AutoChessTactics] 复制成长卡状态失败：{e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 从当前卡和 DeckVersion 链里挑成长最多的状态源。
+    /// 战斗/事件克隆有时只有 DeckVersion 指向牌组本体，这里向上回看能避免复制到旧的默认成长值。
+    /// </summary>
+    private static CardModel FindBestPersistentGrowthStateSource(CardModel source, string increasedProperty)
+    {
+        CardModel best = source;
+        int bestIncrease = TryReadIntProperty(source, increasedProperty, out int sourceIncrease)
+            ? sourceIncrease
+            : int.MinValue;
+
+        CardModel? current = source.DeckVersion;
+        int guard = 0;
+        while (current != null && guard++ < 16)
+        {
+            if (!string.Equals(current.Id.Entry, source.Id.Entry, StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+            if (TryReadIntProperty(current, increasedProperty, out int currentIncrease)
+                && currentIncrease > bestIncrease)
+            {
+                best = current;
+                bestIncrease = currentIncrease;
+            }
+            current = current.DeckVersion;
+        }
+        return best;
+    }
+
+    private static bool TryReadIntProperty(CardModel card, string propertyName, out int value)
+    {
+        value = 0;
+        PropertyInfo? property = card.GetType().GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (property == null || !property.CanRead)
+        {
+            return false;
+        }
+
+        object? raw = property.GetValue(card);
+        if (raw is int intValue)
+        {
+            value = intValue;
+            return true;
+        }
+        if (raw is decimal decimalValue)
+        {
+            value = (int)decimalValue;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryWriteIntProperty(CardModel card, string propertyName, int value)
+    {
+        PropertyInfo? property = card.GetType().GetProperty(
+            propertyName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (property == null || !property.CanWrite)
+        {
+            return false;
+        }
+
+        property.SetValue(card, value);
+        return true;
+    }
+
+    /// <summary>
+    /// 原版成长卡在 OnPlay 末尾会把 DynamicVars 改回一星成长值；
+    /// 对二/三星卡，需要等整张卡真正打完后再补一次星级归一。
+    /// </summary>
+    private static async Task NormalizePersistentGrowthAfterPlay(Task originalTask, CardModel card)
+    {
+        try
+        {
+            await originalTask;
+        }
+        finally
+        {
+            try
+            {
+                NormalizePersistentGrowthCard(card);
+                if (card?.DeckVersion != null)
+                {
+                    NormalizePersistentGrowthCard(card.DeckVersion);
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Debug($"[AutoChessTactics] 成长卡出牌后重新归一失败：{e.Message}");
+            }
+        }
+    }
+
+    private static void NormalizePersistentGrowthCard(CardModel? card)
+    {
+        if (card == null || !IsPersistentGrowthCard(card))
+        {
+            return;
+        }
+
+        int star = StarTracker.GetEffective(card);
+        if (star <= 1)
+        {
+            return;
+        }
+
+        ApplyStarScaling(card, star);
     }
 
     /// <summary>
@@ -1109,6 +1310,24 @@ public static class SynthesisService
             {
                 Log.Debug($"[AutoChessTactics] ClearEnchantmentInternal 后重新归一失败：{e.Message}");
             }
+        }
+    }
+
+    /// <summary>
+    /// 巨镰/遗传算法的成长发生在卡牌自己的 OnPlay 里。
+    /// OnPlayWrapper 是 async Task，普通 Postfix 会在 Task 创建后立刻执行；
+    /// 这里改为包装返回 Task，确保原版出牌逻辑全部结束后再重套星级。
+    /// </summary>
+    [HarmonyPatch(typeof(CardModel), nameof(CardModel.OnPlayWrapper))]
+    private static class PersistentGrowthOnPlayWrapperPatch
+    {
+        public static void Postfix(CardModel __instance, ref Task __result)
+        {
+            if (__result == null || !IsPersistentGrowthCard(__instance))
+            {
+                return;
+            }
+            __result = NormalizePersistentGrowthAfterPlay(__result, __instance);
         }
     }
 
@@ -1244,6 +1463,7 @@ public static class SynthesisService
             }
 
             StarTracker.Set(clone, star);
+            CopyPersistentGrowthState(source, clone);
             // 某些克隆路径只复制了模板值，没有复制牌组本体当前的动态值；
             // 这里按克隆体自己的升级等级重新计算，避免战斗牌与牌组牌不一致。
             ApplyStarScaling(clone, star);

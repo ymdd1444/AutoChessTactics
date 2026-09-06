@@ -19,6 +19,10 @@ public static class AutoChessConfig
     private static int _synthesisCost = 20;
     private static int _shopRefreshCost = 20;
     private static bool _freeShopCardRemoval = true;
+    private static bool _customCardRarityEnabled = false;
+    private static int _customCardRarityCommonPercent = 33;
+    private static int _customCardRarityUncommonPercent = 33;
+    private static int _customCardRarityRarePercent = 34;
 
     /// <summary>每完成一个房间后获得的金币利息百分比（0~100）。</summary>
     public static int InterestPercent
@@ -46,6 +50,34 @@ public static class AutoChessConfig
     {
         get => _freeShopCardRemoval;
         set => _freeShopCardRemoval = value;
+    }
+
+    /// <summary>是否启用自定义卡牌稀有度概率。</summary>
+    public static bool CustomCardRarityEnabled
+    {
+        get => _customCardRarityEnabled;
+        set => _customCardRarityEnabled = value;
+    }
+
+    /// <summary>白卡出现权重（UI 里按百分比显示）。</summary>
+    public static int CustomCardRarityCommonPercent
+    {
+        get => _customCardRarityCommonPercent;
+        set => _customCardRarityCommonPercent = Math.Clamp(value, 0, 100);
+    }
+
+    /// <summary>蓝卡出现权重（UI 里按百分比显示）。</summary>
+    public static int CustomCardRarityUncommonPercent
+    {
+        get => _customCardRarityUncommonPercent;
+        set => _customCardRarityUncommonPercent = Math.Clamp(value, 0, 100);
+    }
+
+    /// <summary>金卡出现权重（UI 里按百分比显示）。</summary>
+    public static int CustomCardRarityRarePercent
+    {
+        get => _customCardRarityRarePercent;
+        set => _customCardRarityRarePercent = Math.Clamp(value, 0, 100);
     }
 
     /// <summary>卡牌最高星级（1星→2星→3星）。</summary>
@@ -98,9 +130,25 @@ public static class AutoChessConfig
             {
                 FreeShopCardRemoval = data["FreeShopCardRemoval"].AsBool();
             }
+            if (data.ContainsKey("CustomCardRarityEnabled"))
+            {
+                CustomCardRarityEnabled = data["CustomCardRarityEnabled"].AsBool();
+            }
+            if (data.ContainsKey("CustomCardRarityCommonPercent"))
+            {
+                CustomCardRarityCommonPercent = data["CustomCardRarityCommonPercent"].AsInt32();
+            }
+            if (data.ContainsKey("CustomCardRarityUncommonPercent"))
+            {
+                CustomCardRarityUncommonPercent = data["CustomCardRarityUncommonPercent"].AsInt32();
+            }
+            if (data.ContainsKey("CustomCardRarityRarePercent"))
+            {
+                CustomCardRarityRarePercent = data["CustomCardRarityRarePercent"].AsInt32();
+            }
 
             Log.Info(
-                $"[AutoChessTactics] 已读取设置：利息 {InterestPercent}%、合成 {SynthesisCost}、刷新 {ShopRefreshCost}、删牌免费={FreeShopCardRemoval}。");
+                $"[AutoChessTactics] 已读取设置：利息 {InterestPercent}%、合成 {SynthesisCost}、刷新 {ShopRefreshCost}、删牌免费={FreeShopCardRemoval}、自定义稀有度={CustomCardRarityEnabled}。");
         }
         catch (Exception e)
         {
@@ -119,6 +167,10 @@ public static class AutoChessConfig
                 ["SynthesisCost"] = SynthesisCost,
                 ["ShopRefreshCost"] = ShopRefreshCost,
                 ["FreeShopCardRemoval"] = FreeShopCardRemoval,
+                ["CustomCardRarityEnabled"] = CustomCardRarityEnabled,
+                ["CustomCardRarityCommonPercent"] = CustomCardRarityCommonPercent,
+                ["CustomCardRarityUncommonPercent"] = CustomCardRarityUncommonPercent,
+                ["CustomCardRarityRarePercent"] = CustomCardRarityRarePercent,
             };
 
             using FileAccess file = FileAccess.Open(ConfigPath, FileAccess.ModeFlags.Write);
@@ -128,5 +180,26 @@ public static class AutoChessConfig
         {
             Log.Warn($"[AutoChessTactics] 保存设置失败：{e.Message}");
         }
+    }
+
+    /// <summary>
+    /// 返回归一化后的卡牌稀有度权重。
+    /// UI 里允许玩家填“1 / 1 / 98”这种百分比写法；底层 roll 时再归一化成 0~1 概率。
+    /// </summary>
+    internal static (float Common, float Uncommon, float Rare) GetCustomCardRarityWeights()
+    {
+        int common = Math.Clamp(CustomCardRarityCommonPercent, 0, 100);
+        int uncommon = Math.Clamp(CustomCardRarityUncommonPercent, 0, 100);
+        int rare = Math.Clamp(CustomCardRarityRarePercent, 0, 100);
+        int total = common + uncommon + rare;
+        if (total <= 0)
+        {
+            return (1f / 3f, 1f / 3f, 1f / 3f);
+        }
+
+        return (
+            common / (float)total,
+            uncommon / (float)total,
+            rare / (float)total);
     }
 }

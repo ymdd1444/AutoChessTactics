@@ -3,7 +3,7 @@
   "name": "自走棋战术 AutoChessTactics",
   "author": "ymdd1444",
   "description": "自走棋式金币利息、商店刷新和卡牌合成玩法，支持星级卡牌、特殊卡与可配置费用。",
-  "version": "0.5.4",
+  "version": "0.5.7",
   "has_pck": false,
   "has_dll": true,
   "affects_gameplay": true

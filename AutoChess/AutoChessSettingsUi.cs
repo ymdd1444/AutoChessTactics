@@ -91,7 +91,7 @@ public sealed partial class AutoChessSettingsUi : Node
             return;
         }
 
-        bool shouldShow = TryFindVisibleModAnchor(tree.Root, out Control? anchor);
+        bool shouldShow = TryFindSelectedModAnchor(tree.Root, out Control? anchor);
         if (!shouldShow)
         {
             HideSettingsButton();
@@ -114,14 +114,15 @@ public sealed partial class AutoChessSettingsUi : Node
     /// 每次扫描当前场景树，不缓存 Label 引用。
     /// 菜单切页和保存退出时节点销毁很快，缓存旧 Control 是 ObjectDisposedException 的来源。
     /// </summary>
-    private bool TryFindVisibleModAnchor(Node node, out Control? anchor)
+    private bool TryFindSelectedModAnchor(Node node, out Control? anchor)
     {
         anchor = null;
         int bestScore = 0;
+        float bestArea = 0f;
 
         try
         {
-            Walk(node, ref anchor, ref bestScore);
+            Walk(node, ref anchor, ref bestScore, ref bestArea);
         }
         catch (ObjectDisposedException)
         {
@@ -131,7 +132,7 @@ public sealed partial class AutoChessSettingsUi : Node
         return anchor != null;
     }
 
-    private void Walk(Node node, ref Control? anchor, ref int bestScore)
+    private void Walk(Node node, ref Control? anchor, ref int bestScore, ref float bestArea)
     {
         if (!IsValid(node))
         {
@@ -154,20 +155,21 @@ public sealed partial class AutoChessSettingsUi : Node
                 return;
             }
 
-            if (node is Label or RichTextLabel)
+            if (node is Control controlNode)
             {
-                string text = GetLabelText((Control)node);
-                int score = GetAnchorScore(text);
-                if (score > bestScore)
+                int score = GetAnchorScore(controlNode);
+                float area = controlNode.Size.X * controlNode.Size.Y;
+                if (score > bestScore || (score == bestScore && area > bestArea))
                 {
                     bestScore = score;
-                    anchor = (Control)node;
+                    bestArea = area;
+                    anchor = controlNode;
                 }
             }
 
             foreach (Node child in node.GetChildren())
             {
-                Walk(child, ref anchor, ref bestScore);
+                Walk(child, ref anchor, ref bestScore, ref bestArea);
             }
         }
         catch (ObjectDisposedException)
@@ -231,18 +233,19 @@ public sealed partial class AutoChessSettingsUi : Node
         }
 
         Vector2 viewportSize = GetViewport()?.GetVisibleRect().Size ?? new Vector2(1920, 1080);
-        float width = Math.Min(460f, Math.Max(300f, viewportSize.X - 48f));
-        _settingsButton!.CustomMinimumSize = new Vector2(width, 52);
-        _settingsButton.Size = new Vector2(width, 52);
+        float width = Math.Min(360f, Math.Max(260f, viewportSize.X * 0.23f));
+        _settingsButton!.CustomMinimumSize = new Vector2(width, 44);
+        _settingsButton.Size = new Vector2(width, 44);
 
-        // 优先把按钮放到右侧 mod 描述块的下方，而不是整个窗口底边居中。
-        // 这样视觉上会更像“该 Mod 自己的设置入口”，也更符合当前管理页布局。
+        // 只跟随右侧详情面板，不跟左侧列表走。这样按钮会固定在选中本 Mod 的说明下面。
         if (IsValid(anchor))
         {
             Vector2 anchorPos = anchor!.GlobalPosition;
+            float x = anchorPos.X + (anchor.Size.X - width) / 2f;
             float anchorBottom = anchorPos.Y + anchor.Size.Y;
-            float x = Math.Max(24f, Math.Min(anchorPos.X, viewportSize.X - width - 24f));
-            float y = Math.Max(24f, Math.Min(anchorBottom + 12f, viewportSize.Y - 72f));
+            float y = anchorBottom + 10f;
+            x = Math.Max(24f, Math.Min(x, viewportSize.X - width - 24f));
+            y = Math.Max(24f, Math.Min(y, viewportSize.Y - 60f));
             _settingsButton.Position = new Vector2(x, y);
             return;
         }
@@ -276,65 +279,105 @@ public sealed partial class AutoChessSettingsUi : Node
         }
     }
 
-    private static string GetLabelText(Control label)
+    private static void ScanSubtreeText(Node node, Action<string> onText)
     {
-        return label switch
+        if (!IsValid(node))
         {
-            Label normal => normal.Text,
-            RichTextLabel rich => rich.Text,
-            _ => string.Empty,
-        };
+            return;
+        }
+
+        try
+        {
+            if (node is Label normal)
+            {
+                onText(normal.Text);
+            }
+            else if (node is RichTextLabel rich)
+            {
+                onText(rich.Text);
+            }
+
+            foreach (Node child in node.GetChildren())
+            {
+                ScanSubtreeText(child, onText);
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // 菜单切页时允许节点在扫描期间失效；直接跳过该分支即可。
+        }
     }
 
-    private static int GetAnchorScore(string text)
+    private static int GetAnchorScore(Control control)
     {
-        if (string.IsNullOrWhiteSpace(text))
+        if (!IsValid(control))
         {
             return 0;
         }
 
-        // 描述文本优先级最高：它通常同时包含“利息 / 合成 / 刷新”这几个关键词。
-        if (text.Contains("利息", StringComparison.OrdinalIgnoreCase)
-            && text.Contains("合成", StringComparison.OrdinalIgnoreCase)
-            && text.Contains("刷新", StringComparison.OrdinalIgnoreCase))
+        // 右侧详情面板通常尺寸更大，左侧列表条目会先被这个门槛过滤掉。
+        if (control.Size.X < 260f || control.Size.Y < 180f)
         {
-            return 100;
+            return 0;
         }
 
-        if (text.Contains("自走棋式金币利息", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("商店刷新和卡牌合成", StringComparison.OrdinalIgnoreCase))
+        bool hasTitle = false;
+        bool hasAuthor = false;
+        bool hasVersion = false;
+        bool hasDescription = false;
+        ScanSubtreeText(control, text =>
         {
-            return 95;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            if (text.Contains("AutoChessTactics", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("自走棋战术", StringComparison.OrdinalIgnoreCase))
+            {
+                hasTitle = true;
+            }
+
+            if (text.Contains("Author:", StringComparison.OrdinalIgnoreCase))
+            {
+                hasAuthor = true;
+            }
+
+            if (text.Contains("Version:", StringComparison.OrdinalIgnoreCase))
+            {
+                hasVersion = true;
+            }
+
+            if (text.Contains("自走棋式金币利息", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("商店刷新和卡牌合成", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("金币利息", StringComparison.OrdinalIgnoreCase))
+            {
+                hasDescription = true;
+            }
+        });
+
+        if (!hasTitle || !hasAuthor || !hasVersion)
+        {
+            return 0;
         }
 
-        if (text.Contains("AutoChessTactics", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("自走棋战术", StringComparison.OrdinalIgnoreCase))
-        {
-            return 70;
-        }
-
-        if (text.Contains("Author:", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("Version:", StringComparison.OrdinalIgnoreCase))
-        {
-            return 40;
-        }
-
-        return 0;
+        return 1000 + (hasDescription ? 50 : 0);
     }
 
     private Button CreateSettingsButton()
     {
         var button = new Button
         {
-            // 和 AncientWaifus 的 Mod 页面设置入口保持相似：底部居中的文字按钮。
+            // 固定在右侧详情面板下方，不再跟着列表乱跑。
             Text = "AutoChess Config (Settings)",
             Flat = true,
             MouseDefaultCursorShape = Control.CursorShape.PointingHand,
-            TooltipText = "设置利息、合成、商店刷新和删牌费用",
+            TooltipText = "设置利息、合成、商店刷新、删牌和稀有度概率",
         };
+        button.SetAnchorsPreset(Control.LayoutPreset.TopLeft);
         button.AddThemeColorOverride("font_color", new Color(0.95f, 0.82f, 0.32f));
         button.AddThemeColorOverride("font_hover_color", Colors.White);
-        button.AddThemeFontSizeOverride("font_size", 28);
+        button.AddThemeFontSizeOverride("font_size", 24);
         button.Pressed += ShowPopup;
         return button;
     }
@@ -428,10 +471,54 @@ public sealed partial class AutoChessSettingsUi : Node
         };
         rows.AddChild(freeRemoval);
 
+        rows.AddChild(CreateSectionTitle("稀有度概率"));
+
+        var customRarity = new CheckButton
+        {
+            Text = "自定义稀有度概率",
+            ButtonPressed = AutoChessConfig.CustomCardRarityEnabled,
+        };
+        customRarity.Toggled += enabled =>
+        {
+            AutoChessConfig.CustomCardRarityEnabled = enabled;
+            AutoChessConfig.Save();
+        };
+        rows.AddChild(customRarity);
+
+        rows.AddChild(CreateNumberRow("白卡权重 (%)", AutoChessConfig.CustomCardRarityCommonPercent, 0, 100,
+            value =>
+            {
+                AutoChessConfig.CustomCardRarityCommonPercent = value;
+                AutoChessConfig.Save();
+            }));
+        rows.AddChild(CreateNumberRow("蓝卡权重 (%)", AutoChessConfig.CustomCardRarityUncommonPercent, 0, 100,
+            value =>
+            {
+                AutoChessConfig.CustomCardRarityUncommonPercent = value;
+                AutoChessConfig.Save();
+            }));
+        rows.AddChild(CreateNumberRow("金卡权重 (%)", AutoChessConfig.CustomCardRarityRarePercent, 0, 100,
+            value =>
+            {
+                AutoChessConfig.CustomCardRarityRarePercent = value;
+                AutoChessConfig.Save();
+            }));
+
         var close = new Button { Text = "关闭" };
         close.Pressed += () => panel.Visible = false;
         rows.AddChild(close);
         return panel;
+    }
+
+    private static Label CreateSectionTitle(string text)
+    {
+        var label = new Label
+        {
+            Text = text,
+        };
+        label.AddThemeColorOverride("font_color", new Color(0.95f, 0.82f, 0.32f));
+        label.AddThemeFontSizeOverride("font_size", 20);
+        return label;
     }
 
     private static Control CreateNumberRow(

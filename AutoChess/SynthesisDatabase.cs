@@ -104,13 +104,13 @@ public static partial class SynthesisDatabase
         {
             return new SynthesisCardRule(SynthesisCardPolicy.Orb);
         }
-        if (entry != null && IsAutoMergeableEntry(entry))
-        {
-            return _automatic;
-        }
         if (entry != null && _rules.Value.TryGetValue(entry, out SynthesisCardRule? rule))
         {
             return rule;
+        }
+        if (entry != null && IsAutoMergeableEntry(entry))
+        {
+            return _automatic;
         }
         return _conservative;
     }
@@ -190,6 +190,54 @@ public static partial class SynthesisDatabase
             "furnace", "greed", "largesse", "malaise", "murder", "poor_sleep",
             "reaper_form", "regret", "reaper_form", "royalties", "soulbound", "times_up",
             "unmovable");
+
+        // Osty 体系使用了几组独立变量名：
+        //   - OstyDamage：由 Osty 发起的攻击伤害；
+        //   - Summon：OstyCmd.Summon 的生命/召唤强度，不是“召唤次数”；
+        //   - Heal：恢复量；
+        //   - CalculationBase/ExtraDamage：Protector/Squeeze/Unleash 这类公式型 Osty 攻击的基础项。
+        // 这些卡原本落在 SPECIAL 的保守路径里，只显示星级但不改数值；这里逐卡覆盖，
+        // 同时仍然不放大选择次数、X 次数、抽牌数量或结构性操作次数。
+        Add(result, SynthesisCardPolicy.Summoner,
+            new[] { "Summon", "Heal" },
+            "afterlife", "bodyguard", "cleanse", "dirge", "legion_of_bone",
+            "necro_mastery", "reanimate", "spur");
+
+        Add(result, SynthesisCardPolicy.ComplexChoice,
+            new[] { "OstyDamage" },
+            "flatten", "poke", "snap", "sweeping_gaze");
+
+        Add(result, SynthesisCardPolicy.ComplexChoice,
+            new[] { "CalculationBase", "ExtraDamage" },
+            "protector", "squeeze", "unleash");
+
+        // 储君/Regent 里有几张 SPECIAL 卡的可缩放值不是 Damage/Block：
+        // 铸剑者(the_smith) 使用 Forge，王国资产(royalties) 使用 Gold。
+        // 单独注册能让它们升星后数值增长，同时不放大额外奖励次数或事件次数。
+        Add(result, SynthesisCardPolicy.StatefulEvent,
+            new[] { "Forge" },
+            "the_smith");
+
+        Add(result, SynthesisCardPolicy.StatefulEvent,
+            new[] { "Gold" },
+            "royalties");
+
+        // 天际钻头的 Energy=4 是“花费达到 4 时连击翻倍”的阈值，不是收益数值。
+        // 它在 AUTO 列表里，所以这里用显式规则覆盖自动缩放，只放大 Damage，保留阈值 4。
+        Add(result, SynthesisCardPolicy.ComplexChoice,
+            new[] { "Damage" },
+            "heavenly_drill");
+
+        // 这两张卡有永久成长字段：CurrentDamage/CurrentBlock 与 Increased*。
+        // 规则层只声明 Damage/Block 和每次成长量 Increase 可缩放；
+        // SynthesisService 会额外保留成长字段，避免升星/克隆/读档把成长重置。
+        Add(result, SynthesisCardPolicy.ComplexChoice,
+            new[] { "Damage", "Increase" },
+            "the_scythe");
+
+        Add(result, SynthesisCardPolicy.ComplexChoice,
+            new[] { "Block", "Increase" },
+            "genetic_algorithm");
 
         return result;
     }
